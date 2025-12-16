@@ -1,0 +1,28 @@
+# ar_config_v2.yaml
+
+llm_hidden_size: 3584
+decoder_hidden_size: 3584 # hidden_size * 4
+decoder_ffn_dim: 14336  # hidden_size * 4
+decoder_num_heads: 32
+decoder_dropout: 0.1
+decoder_num_layers: 4
+encoder_num_layers: 2  
+unit_vocab_size: 6561
+max_speech_tokens: 4096
+max_seq_length: 8192  
+
+# special token
+special_tokens: 4
+speech_bos_token_id: 6561  # unit_vocab_size + 0
+speech_sos_token_id: 6562  # unit_vocab_size + 1
+speech_eos_token_id: 6563  # unit_vocab_size + 2
+speech_padding_token_id: 6564  # unit_vocab_size + 3
+
+# LlamaConfig
+speech_max_position_embeddings: 2048
+
+# Group
+group_size: 3
+txt_token_num: 5
+speech_token_num: 15
+mtp_num: 5
