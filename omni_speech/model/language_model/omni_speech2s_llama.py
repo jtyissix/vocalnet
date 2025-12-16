@@ -268,7 +268,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
 
         hidden_states = outputs['hidden_states']
         hidden_states = torch.cat([hidden_states[0][-1][:, -1:, :]] + [hidden_states[i][-1] for i in range(1, len(hidden_states))], dim=1)
-
+        #breakpoint()
         stop_tokens = [13, 30, 0, 11] # , . ! ?
         text_token = outputs['sequences'][0].tolist()
         stop_token_indices = [i for i, token in enumerate(text_token) if token in stop_tokens] # [0, 59, 77]
@@ -464,6 +464,278 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
             inputs['speech'] = speech
             inputs['speech_lengths'] = speech_lengths
         return inputs
-
+    #temporary SD testing function
+    @torch.no_grad()
+    def verify_with_draft(
+        self,
+        inputs: torch.Tensor,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        infer_mtp_token_num: int = 2,
+    ) -> torch.Tensor:
+        """
+        验证draft tokens，返回logits
+        Args:
+            inputs: input_ids
+            speech: 音频特征
+            speech_lengths: 音频长度
+            draft_tokens: (1, k) draft生成的tokens
+            infer_mtp_token_num: MTP层数
+        Returns:
+            logits_list: 每个segment对应的logits列表
+        """
+        # 准备inputs
+        position_ids = None
+        attention_mask = None
+        
+        if speech is not None:
+            (
+                inputs,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                labels
+            ) = self.prepare_inputs_labels_for_speech_and_text(
+                inputs,
+                position_ids,
+                attention_mask,
+                None,
+                None,
+                speech,
+                speech_lengths
+            )
+        else:
+            inputs_embeds = self.get_model().embed_tokens(inputs)
+        
+        # 拼接draft_tokens到inputs
+        draft_embeds = self.get_model().embed_tokens(draft_tokens)
+        full_embeds = torch.cat([inputs_embeds, draft_embeds], dim=1)
+        
+        # 更新attention_mask
+        if attention_mask is not None:
+            draft_mask = torch.ones(1, draft_tokens.shape[1], device=attention_mask.device)
+            full_attention_mask = torch.cat([attention_mask, draft_mask], dim=1)
+        else:
+            full_attention_mask = None
+        
+        # Forward获取所有hidden states
+        outputs = super(OmniSpeechLlamaForCausalLM, self).forward(
+            inputs_embeds=full_embeds,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # 提取draft部分的hidden states
+        hidden_states = outputs.hidden_states[-1]  # 最后一层
+        draft_hidden = hidden_states[:, inputs_embeds.shape[1]:, :]  # 只要draft部分
+        
+        # 按照stop_tokens切分
+        stop_tokens = [13, 30, 0, 11]  # , . ! ?
+        all_tokens = torch.cat([inputs[0], draft_tokens[0]]).tolist()
+        
+        # 找stop token位置
+        stop_token_indices = [i for i, token in enumerate(all_tokens) if token in stop_tokens]
+        filter_stop_token_indices = [0]
+        token_num_bound = 50
+        
+        while stop_token_indices:
+            index = stop_token_indices.pop(0)
+            if index - filter_stop_token_indices[-1] > token_num_bound:
+                filter_stop_token_indices.append(index)
+        
+        if filter_stop_token_indices[-1] == len(all_tokens) - 2:
+            filter_stop_token_indices[-1] = len(all_tokens) - 1
+        else:
+            filter_stop_token_indices += [len(all_tokens) - 1]
+        
+        filter_stop_token_indices = [index + 1 for index in filter_stop_token_indices]
+        filter_stop_token_indices[0] = 0
+        
+        # 切分hidden states
+        txt_eos_emb = self.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
+        
+        # 调整索引（因为draft_hidden是从inputs后开始的）
+        input_len = inputs.shape[1]
+        adjusted_indices = []
+        for idx in filter_stop_token_indices:
+            if idx >= input_len:
+                adjusted_indices.append(idx - input_len)
+        
+        if not adjusted_indices or adjusted_indices[0] != 0:
+            adjusted_indices.insert(0, 0)
+        if adjusted_indices[-1] != draft_hidden.shape[1]:
+            adjusted_indices.append(draft_hidden.shape[1])
+        
+        # 切分并添加eos
+        hidden_states_list = []
+        for i in range(len(adjusted_indices) - 1):
+            segment = draft_hidden[:, adjusted_indices[i]:adjusted_indices[i+1], :]
+            segment_with_eos = torch.cat([segment, txt_eos_emb], dim=1)
+            hidden_states_list.append(segment_with_eos)
+        
+        # 对每个segment调用speech_generator
+        logits_list = []
+        for hidden_segment in hidden_states_list:
+            if infer_mtp_token_num > 0:
+                # 调用verify_mtp
+                segment_logits = self.speech_generator.verify_mtp(
+                    hidden_segment,
+                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device),
+                    infer_mtp_token_num=infer_mtp_token_num
+                )
+                logits_list.extend(segment_logits)
+            else:
+                # 调用verify
+                segment_logits = self.speech_generator.verify(
+                    hidden_segment,
+                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device)
+                )
+                logits_list.append(segment_logits)
+        
+        return logits_list
+    @torch.no_grad()
+    #this function should be hold deprecated immediately
+    def check_correctness_temp_func(
+        self,
+        inputs: torch.Tensor,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        streaming_unit_gen=False,
+        infer_mtp_token_num=0,
+        streaming=False,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        验证此模型draft机制代码的正确性，通过标准generate的hidden state拼接测试
+        """
+        # 准备inputs
+        position_ids = None
+        attention_mask = None
+        breakpoint()
+        if speech is not None:
+            (
+                inputs,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                labels
+            ) = self.prepare_inputs_labels_for_speech_and_text(
+                inputs,
+                position_ids,
+                attention_mask,
+                None,
+                None,
+                speech,
+                speech_lengths
+            )
+        else:
+            inputs_embeds = self.get_model().embed_tokens(inputs)
+        outputs = GenerationWithCTC.generate(
+            self,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            streaming_unit_gen=streaming_unit_gen,
+            **kwargs
+        )
+        # 拼接draft_tokens到inputs
+        corr_hidden_states = outputs['hidden_states']
+        corr_hidden_states = torch.cat([corr_hidden_states[0][-1][:, -1:, :]] + [corr_hidden_states[i][-1] for i in range(1, len(corr_hidden_states))], dim=1)
+        breakpoint()
+        stop_tokens = [13, 30, 0, 11] # , . ! ?
+        text_token = outputs['sequences'][0].tolist()
+        draft_embeds = self.get_model().embed_tokens(torch.tensor([text_token[0:2]],device=corr_hidden_states.device))
+        full_embeds = torch.cat([inputs_embeds, draft_embeds], dim=1)
+        
+        # 更新attention_mask
+        if attention_mask is not None:
+            draft_mask = torch.ones(1, draft_tokens.shape[1], device=attention_mask.device)
+            full_attention_mask = torch.cat([attention_mask, draft_mask], dim=1)
+        else:
+            full_attention_mask = None
+        
+        # Forward获取所有hidden states
+        outputs = super(OmniSpeechLlamaForCausalLM, self).forward(
+            inputs_embeds=full_embeds,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # 提取draft部分的hidden states
+        hidden_states = outputs.hidden_states[-1]  # 最后一层
+        draft_hidden = hidden_states[:, inputs_embeds.shape[1]:, :]  # 只要draft部分
+        #check here
+        breakpoint()
+        # 按照stop_tokens切分
+        stop_tokens = [13, 30, 0, 11]  # , . ! ?
+        all_tokens = torch.cat([inputs[0], draft_tokens[0]]).tolist()
+        
+        # 找stop token位置
+        stop_token_indices = [i for i, token in enumerate(all_tokens) if token in stop_tokens]
+        filter_stop_token_indices = [0]
+        token_num_bound = 50
+        
+        while stop_token_indices:
+            index = stop_token_indices.pop(0)
+            if index - filter_stop_token_indices[-1] > token_num_bound:
+                filter_stop_token_indices.append(index)
+        
+        if filter_stop_token_indices[-1] == len(all_tokens) - 2:
+            filter_stop_token_indices[-1] = len(all_tokens) - 1
+        else:
+            filter_stop_token_indices += [len(all_tokens) - 1]
+        
+        filter_stop_token_indices = [index + 1 for index in filter_stop_token_indices]
+        filter_stop_token_indices[0] = 0
+        
+        # 切分hidden states
+        txt_eos_emb = self.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
+        
+        # 调整索引（因为draft_hidden是从inputs后开始的）
+        input_len = inputs.shape[1]
+        adjusted_indices = []
+        for idx in filter_stop_token_indices:
+            if idx >= input_len:
+                adjusted_indices.append(idx - input_len)
+        
+        if not adjusted_indices or adjusted_indices[0] != 0:
+            adjusted_indices.insert(0, 0)
+        if adjusted_indices[-1] != draft_hidden.shape[1]:
+            adjusted_indices.append(draft_hidden.shape[1])
+        
+        # 切分并添加eos
+        hidden_states_list = []
+        for i in range(len(adjusted_indices) - 1):
+            segment = draft_hidden[:, adjusted_indices[i]:adjusted_indices[i+1], :]
+            segment_with_eos = torch.cat([segment, txt_eos_emb], dim=1)
+            hidden_states_list.append(segment_with_eos)
+        
+        # 对每个segment调用speech_generator
+        logits_list = []
+        for hidden_segment in hidden_states_list:
+            if infer_mtp_token_num > 0:
+                # 调用verify_mtp
+                segment_logits = self.speech_generator.verify_mtp(
+                    hidden_segment,
+                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device),
+                    infer_mtp_token_num=infer_mtp_token_num
+                )
+                logits_list.extend(segment_logits)
+            else:
+                # 调用verify
+                segment_logits = self.speech_generator.verify(
+                    hidden_segment,
+                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device)
+                )
+                logits_list.append(segment_logits)
+        
+        return logits_list
 AutoConfig.register("omni_speech2s_llama", OmniSpeech2SConfig)
 AutoModelForCausalLM.register(OmniSpeech2SConfig, OmniSpeech2SLlamaForCausalLM)
