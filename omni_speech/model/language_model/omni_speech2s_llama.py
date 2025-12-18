@@ -307,8 +307,101 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
             
         # return segment_seq, units_pred_list
         return outputs.sequences, units_pred
+    #this is used for draft model to generate
+    #this will return fine-grained info
+    #to achieve,we need draft text tokens,draft audio token list,?filter indices
+    @torch.no_grad()
+    def draft_generate(
+        self,
+        inputs: Optional[torch.Tensor] = None,
+        speech: Optional[torch.Tensor] = None,
+        speech_lengths: Optional[torch.Tensor] = None,
+        streaming_unit_gen=False,
+        infer_mtp_token_num=0,
+        streaming=False,
+        **kwargs,
+    ) -> Union[GenerateOutput, torch.LongTensor]:
+        position_ids = kwargs.pop("position_ids", None)
+        attention_mask = kwargs.pop("attention_mask", None)
+        if "inputs_embeds" in kwargs:
+            raise NotImplementedError("`inputs_embeds` is not supported")
 
+        if speech is not None:
+            (
+                inputs,
+                position_ids,
+                attention_mask,
+                _,
+                inputs_embeds,
+                labels
+            ) = self.prepare_inputs_labels_for_speech_and_text(
+                inputs,
+                position_ids,
+                attention_mask,
+                None,
+                None,
+                speech,
+                speech_lengths
+            )
+        else:
+            inputs_embeds = self.get_model().embed_tokens(inputs)
 
+        outputs = GenerationWithCTC.generate(
+            self,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            streaming_unit_gen=streaming_unit_gen,
+            **kwargs
+        )
+
+        hidden_states = outputs['hidden_states']
+        hidden_states = torch.cat([hidden_states[0][-1][:, -1:, :]] + [hidden_states[i][-1] for i in range(1, len(hidden_states))], dim=1)
+        #breakpoint()
+        stop_tokens = [13, 30, 0, 11] # , . ! ?
+        text_token = outputs['sequences'][0].tolist()
+        stop_token_indices = [i for i, token in enumerate(text_token) if token in stop_tokens] # [0, 59, 77]
+        filter_stop_token_indices = [0]
+        token_num_bound = 50
+        while stop_token_indices:
+            index = stop_token_indices.pop(0)
+            if index - filter_stop_token_indices[-1] > token_num_bound:
+                filter_stop_token_indices.append(index)
+        if filter_stop_token_indices[-1] == len(text_token) - 2:
+            filter_stop_token_indices[-1] = len(text_token) - 1
+        else:
+            filter_stop_token_indices += [len(text_token) - 1]
+        filter_stop_token_indices = [index + 1 for index in filter_stop_token_indices]
+        filter_stop_token_indices[0] = 0
+        # if len(filter_stop_token_indices) > 3 and filter_stop_token_indices[-1] - filter_stop_token_indices[-2] < token_num_bound:
+        #     filter_stop_token_indices.pop(-2)
+        txt_eos_emb = self.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
+        hidden_states_list = [hidden_states[:, filter_stop_token_indices[i]:filter_stop_token_indices[i+1], :] for i in range(len(filter_stop_token_indices) - 1)]
+        hidden_states_list = [torch.cat([hidden[:, :, :], txt_eos_emb], dim=1) for hidden in hidden_states_list]
+        segment_seq = [outputs['sequences'][:, filter_stop_token_indices[i]:filter_stop_token_indices[i+1]] for i in range(len(filter_stop_token_indices) - 1)]
+        tot_logit=[]
+        units_pred_list = [torch.tensor([[self.config.speech_sos_token_id]], device=hidden_states.device)]
+        for hidden in hidden_states_list:
+            if infer_mtp_token_num > 0:
+                if streaming:
+                    units_pred_list.append(self.speech_generator.pseudo_streaming_predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
+                else:
+                    # print("streaming!!")
+                    units_pred_list.append(self.speech_generator.predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
+            else:
+                #breakpoint()
+                tok,logit=self.speech_generator.predict(hidden,require_logits=True)
+                units_pred_list.append(tok[:,1:-1])
+                tot_logit.append(logit)
+                #units_pred_list.append(self.speech_generator.predict(hidden)[:,1:-1])
+        units_pred_list.append(torch.tensor([[self.config.speech_eos_token_id]], device=hidden_states.device))
+        units_pred = torch.cat(units_pred_list, dim=1).contiguous()
+
+            
+        return outputs.sequences,segment_seq,units_pred_list,units_pred,tot_logit
+        #return outputs.sequences, units_pred
     @torch.no_grad()
     def streaming_generate_mtp(
         self,
@@ -472,7 +565,10 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         speech: torch.Tensor,
         speech_lengths: torch.Tensor,
         draft_tokens: torch.Tensor,
+        #draft_seq_list,
+        audio_unit_list,
         infer_mtp_token_num: int = 2,
+        
     ) -> torch.Tensor:
         """
         验证draft tokens，返回logits
@@ -530,11 +626,12 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         
         # 提取draft部分的hidden states
         hidden_states = outputs.hidden_states[-1]  # 最后一层
-        draft_hidden = hidden_states[:, inputs_embeds.shape[1]:, :]  # 只要draft部分
+        draft_hidden = hidden_states[:, inputs_embeds.shape[1]-1:-1, :]  # 只要draft部分
         
         # 按照stop_tokens切分
         stop_tokens = [13, 30, 0, 11]  # , . ! ?
-        all_tokens = torch.cat([inputs[0], draft_tokens[0]]).tolist()
+        #here we only divide the generated tokens i.e. draft tokens
+        all_tokens = draft_tokens[0].tolist()
         
         # 找stop token位置
         stop_token_indices = [i for i, token in enumerate(all_tokens) if token in stop_tokens]
@@ -557,41 +654,34 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         # 切分hidden states
         txt_eos_emb = self.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
         
-        # 调整索引（因为draft_hidden是从inputs后开始的）
-        input_len = inputs.shape[1]
-        adjusted_indices = []
-        for idx in filter_stop_token_indices:
-            if idx >= input_len:
-                adjusted_indices.append(idx - input_len)
-        
-        if not adjusted_indices or adjusted_indices[0] != 0:
-            adjusted_indices.insert(0, 0)
-        if adjusted_indices[-1] != draft_hidden.shape[1]:
-            adjusted_indices.append(draft_hidden.shape[1])
-        
-        # 切分并添加eos
-        hidden_states_list = []
-        for i in range(len(adjusted_indices) - 1):
-            segment = draft_hidden[:, adjusted_indices[i]:adjusted_indices[i+1], :]
-            segment_with_eos = torch.cat([segment, txt_eos_emb], dim=1)
-            hidden_states_list.append(segment_with_eos)
-        
+        hidden_states_list = [
+            draft_hidden[:, filter_stop_token_indices[i]:filter_stop_token_indices[i+1], :] 
+            for i in range(len(filter_stop_token_indices) - 1)
+        ]
+        hidden_states_list = [
+            torch.cat([hidden, txt_eos_emb], dim=1) 
+            for hidden in hidden_states_list
+        ]
+        #breakpoint()
+        #!!!注意待会要改掉，返回第一个也是sos，但是送进pre还会自己加，要从第二个开始取
+        #解决方案：speech_generator_ar_mtp verify等不要再添加sos_token
         # 对每个segment调用speech_generator
         logits_list = []
-        for hidden_segment in hidden_states_list:
+        for idx,hidden_segment in enumerate(hidden_states_list):
             if infer_mtp_token_num > 0:
                 # 调用verify_mtp
+                #this verify_mtp will be modified later
+            
                 segment_logits = self.speech_generator.verify_mtp(
                     hidden_segment,
-                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device),
+                    audio_unit_list[idx],
                     infer_mtp_token_num=infer_mtp_token_num
                 )
                 logits_list.extend(segment_logits)
             else:
                 # 调用verify
                 segment_logits = self.speech_generator.verify(
-                    hidden_segment,
-                    torch.tensor([[self.config.speech_sos_token_id]], device=hidden_segment.device)
+                    hidden_segment,audio_unit_list[idx]
                 )
                 logits_list.append(segment_logits)
         
@@ -614,7 +704,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         # 准备inputs
         position_ids = None
         attention_mask = None
-        breakpoint()
+        #breakpoint()
         if speech is not None:
             (
                 inputs,
@@ -647,7 +737,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         # 拼接draft_tokens到inputs
         corr_hidden_states = outputs['hidden_states']
         corr_hidden_states = torch.cat([corr_hidden_states[0][-1][:, -1:, :]] + [corr_hidden_states[i][-1] for i in range(1, len(corr_hidden_states))], dim=1)
-        breakpoint()
+        #breakpoint()
         stop_tokens = [13, 30, 0, 11] # , . ! ?
         text_token = outputs['sequences'][0].tolist()
         draft_embeds = self.get_model().embed_tokens(torch.tensor([text_token[0:2]],device=corr_hidden_states.device))
@@ -737,5 +827,45 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                 logits_list.append(segment_logits)
         
         return logits_list
+    #should be deprecated imediately
+    @torch.no_grad()
+    def check_correctness_temp_func2(
+        self,
+        inputs: torch.Tensor,
+        speech: torch.Tensor,
+        speech_lengths: torch.Tensor,
+        streaming_unit_gen=False,
+        infer_mtp_token_num=0,
+        streaming=False,
+        **kwargs
+    ) -> torch.Tensor:
+        """
+        验证此模型draft机制代码的正确性，通过标准generate的hidden state拼接测试
+        """
+        # 准备inputs
+        outputs,segment_seq,units_pred_list,units_pred,tot_logit=self.draft_generate(
+        
+        inputs,
+        speech,
+        speech_lengths,
+        streaming_unit_gen,
+        infer_mtp_token_num,
+        streaming,
+        **kwargs,
+        )
+        #units_pred_list:[[[sos]],[[true-audio-tokens]],[[eos]]
+        #you should pass in units list without sos and eos!!
+        #predict in speech generator should handle this overhead!!
+        breakpoint()
+        test_logit=self.verify_with_draft(
+        inputs,
+        speech,
+        speech_lengths,
+        draft_tokens=segment_seq[0],
+        #draft_seq_list,
+        audio_unit_list=[units_pred_list[1][0:2]],
+        infer_mtp_token_num=0,)
+        breakpoint()
+        return 0
 AutoConfig.register("omni_speech2s_llama", OmniSpeech2SConfig)
 AutoModelForCausalLM.register(OmniSpeech2SConfig, OmniSpeech2SLlamaForCausalLM)

@@ -435,7 +435,7 @@ class VocalNetModel:
         speedup_ratio = None
         with torch.inference_mode():
             if self.s2s:
-                outputs = self.model.check_correctness_temp_func(
+                outputs = self.model.check_correctness_temp_func2(
                     input_ids,
                     speech=speech_tensor,
                     speech_lengths=speech_length,
@@ -447,7 +447,7 @@ class VocalNetModel:
                     use_cache=True,
                     pad_token_id=128004,
                     streaming_unit_gen=False,
-                    infer_mtp_token_num=2,
+                    infer_mtp_token_num=0,
                     streaming = False,
                 )
                 output_ids, output_units = outputs

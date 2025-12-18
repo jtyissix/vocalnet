@@ -397,7 +397,7 @@ class SpeechGeneratorARMTP(nn.Module):
 
 
     # def predict(self, hidden, top_k, prefix, penalty_window_size, penalty, max_tokens=1000):
-    def predict(self, hidden, top_k=1, prefix=None, penalty_window_size=0, penalty=0, max_tokens=512):
+    def predict(self, hidden, top_k=1, prefix=None, penalty_window_size=0, penalty=0, max_tokens=512,require_logits=False):
         # Pass through pre_nn
         hidden = self.pre_nn_forward(hidden, [hidden.size(1)])
         # Concat bos embedding
@@ -417,7 +417,7 @@ class SpeechGeneratorARMTP(nn.Module):
         generated_tokens = torch.full((1, 1), self.sos_token, dtype=torch.long, device=hidden.device)
         # generate tokens
 
-
+        tot_logit=[]
         for i in range(max_tokens):
             inputs_embeds = self.embedding(cur_token)
             past_seen_tokens = past_key_values.get_seq_length()
@@ -427,7 +427,8 @@ class SpeechGeneratorARMTP(nn.Module):
 
             # Project to vocabulary size
             logits = self.output_proj(hidden_states)
-
+            temp=logits.squeeze(0).squeeze(0).tolist()
+            tot_logit.append(temp)
             # apply penalty
             if penalty_window_size > 0:
                 for token in set(generated_tokens[0][-penalty_window_size:]):
@@ -450,6 +451,10 @@ class SpeechGeneratorARMTP(nn.Module):
             if next_token_id == self.eos_token:
                 break
         # pdb.set_trace()
+        breakpoint()
+        if require_logits:
+            return generated_tokens,tot_logit
+            #this logit:[len(generated_tokens),1,1,logit_width]
         return generated_tokens
     
 
@@ -834,3 +839,44 @@ class SpeechGeneratorARMTP(nn.Module):
             
     def set_last_chunk(self, is_last=True):
         self._is_last_chunk = is_last
+    def verify(self, hidden,audio_tokens_seg):
+        """
+        验证draft units
+        Args:
+            hidden: segment的hidden (1, seg_len, hidden_size)
+            audio_tokens_seg: audio tokens to be verified
+        Returns:
+            logits: (1, num_units, vocab_size)
+        """
+        # 预处理hidden
+        hidden = self.pre_nn_forward(hidden, [hidden.size(1)])
+        bos_emb = self.embedding(torch.full((1, 1), self.bos_token, dtype=torch.long, device=hidden.device))
+        hidden = torch.cat([bos_emb, hidden], dim=1)
+        
+        # 初始化cache
+        past_key_values = DynamicCache.from_legacy_cache(None)
+        inputs_embeds=hidden
+        past_seen_tokens = 0
+        # 第一步：处理text hidden
+        cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], \
+                                      device=inputs_embeds.device)
+        hidden_states = self.transformer_infer(hidden, cache_position, past_key_values)
+        breakpoint()
+        # init generated tokens
+        
+        cur_token = torch.full((1, 1), self.sos_token, dtype=torch.long, device=hidden.device)
+        #torchcat cur_token(start_token) with audio_token_seq to build whole input to get verified
+        verified_token_seq=torch.cat([cur_token,audio_tokens_seg],dim=1)
+        #generated_tokens = torch.full((1, 1), self.sos_token, dtype=torch.long, device=hidden.device)
+        # 第二步：验证所有draft units
+        inputs_embeds = self.embedding(verified_token_seq)
+        past_seen_tokens = past_key_values.get_seq_length()
+        cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
+        #no need to penalty in this situation
+        hidden_states = self.transformer_infer(inputs_embeds, cache_position, past_key_values)
+        hidden_states = self.norm(hidden_states)
+        logits = self.output_proj(hidden_states)[:,:-1,:]
+        logits=logits.squeeze(0).tolist()
+        #not conclude last one because we need given tokens' logit not next one's
+        
+        return logits
