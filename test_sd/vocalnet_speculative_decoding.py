@@ -2,7 +2,7 @@ import sys
 import os
 from accelerate import dispatch_model, infer_auto_device_map
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
+#os.environ["CUDA_VISIBLE_DEVICES"] = "PCI_BUS_ID"
 for p in sys.path:
     print(p)
 sys.path.insert(0, '/home/jiangtianyuan/resource/voice/vocalnet/')
@@ -10,6 +10,7 @@ sys.path.append('/home/jiangtianyuan/resource/voice/vocalnet/')
 
 print('hello')
 import torch
+import torch.nn.functional as F
 from typing import Tuple, Callable, List, Dict
 from omni_speech.model.builder import load_pretrained_model
 from omni_speech.datasets.preprocess import preprocess_llama_3_v1, preprocess_qwen_2_5_v1
@@ -165,48 +166,58 @@ class CosyvoiceVocoder:
 class SpeculativeDecodingStats:
     """统计投机解码的指标"""
     def __init__(self):
-        self.total_draft_tokens = 0
-        self.total_accepted_tokens = 0
-        self.num_iterations = 0
+        self.num_audio_tokens_list = []  # 每次的audio token数量
+        self.expected_accepted_list = []  # 每次的期望接受数
+        self.acceptance_rate_list = []    # 每次的接受率
         self.draft_times = []
         self.verify_times = []
         
-    def update(self, draft_tokens: int, accepted_tokens: int, draft_time: float, verify_time: float):
-        self.total_draft_tokens += draft_tokens
-        self.total_accepted_tokens += accepted_tokens
-        self.num_iterations += 1
+    def update(self, num_audio_tokens: int, expected_accepted: float, draft_time: float, verify_time: float):
+        """更新统计信息"""
+        self.num_audio_tokens_list.append(num_audio_tokens)
+        self.expected_accepted_list.append(expected_accepted)
+        acceptance_rate = expected_accepted / num_audio_tokens if num_audio_tokens > 0 else 0
+        self.acceptance_rate_list.append(acceptance_rate)
         self.draft_times.append(draft_time)
         self.verify_times.append(verify_time)
     
-    def get_acceptance_rate(self) -> float:
-        if self.total_draft_tokens == 0:
-            return 0.0
-        return self.total_accepted_tokens / self.total_draft_tokens
-    
     def get_summary(self) -> Dict:
+        """获取统计摘要"""
+        if len(self.acceptance_rate_list) == 0:
+            return {
+                'num_samples': 0,
+                'avg_acceptance_rate': 0,
+                'avg_expected_accepted': 0,
+                'avg_num_audio_tokens': 0,
+                'avg_draft_time': 0,
+                'avg_verify_time': 0
+            }
+        
         return {
-            'acceptance_rate': self.get_acceptance_rate(),
-            'total_draft_tokens': self.total_draft_tokens,
-            'total_accepted_tokens': self.total_accepted_tokens,
-            'num_iterations': self.num_iterations,
-            'avg_draft_time': np.mean(self.draft_times) if self.draft_times else 0,
-            'avg_verify_time': np.mean(self.verify_times) if self.verify_times else 0,
-            'avg_accepted_per_iteration': self.total_accepted_tokens / self.num_iterations if self.num_iterations > 0 else 0
+            'num_samples': len(self.acceptance_rate_list),
+            'avg_acceptance_rate': np.mean(self.acceptance_rate_list),
+            'std_acceptance_rate': np.std(self.acceptance_rate_list),
+            'avg_expected_accepted': np.mean(self.expected_accepted_list),
+            'std_expected_accepted': np.std(self.expected_accepted_list),
+            'avg_num_audio_tokens': np.mean(self.num_audio_tokens_list),
+            'std_num_audio_tokens': np.std(self.num_audio_tokens_list),
+            'avg_draft_time': np.mean(self.draft_times),
+            'avg_verify_time': np.mean(self.verify_times),
         }
     
     def print_summary(self):
+        """打印统计摘要"""
         summary = self.get_summary()
-        print("\n" + "="*50)
-        print("Speculative Decoding Statistics")
-        print("="*50)
-        print(f"Acceptance Rate: {summary['acceptance_rate']*100:.2f}%")
-        print(f"Total Draft Tokens: {summary['total_draft_tokens']}")
-        print(f"Total Accepted Tokens: {summary['total_accepted_tokens']}")
-        print(f"Number of Iterations: {summary['num_iterations']}")
-        print(f"Avg Accepted per Iteration: {summary['avg_accepted_per_iteration']:.2f}")
-        print(f"Avg Draft Time: {summary['avg_draft_time']*1000:.2f}ms")
-        print(f"Avg Verify Time: {summary['avg_verify_time']*1000:.2f}ms")
-        print("="*50 + "\n")
+        print("\n" + "="*70)
+        print("Audio Token Acceptance Statistics")
+        print("="*70)
+        print(f"Number of samples: {summary['num_samples']}")
+        print(f"Average Acceptance Rate: {summary['avg_acceptance_rate']*100:.2f}% (±{summary.get('std_acceptance_rate', 0)*100:.2f}%)")
+        print(f"Average Expected Accepted: {summary['avg_expected_accepted']:.2f} (±{summary.get('std_expected_accepted', 0):.2f})")
+        print(f"Average Audio Tokens: {summary['avg_num_audio_tokens']:.1f} (±{summary.get('std_num_audio_tokens', 0):.1f})")
+        print(f"Average Draft Time: {summary['avg_draft_time']*1000:.2f}ms")
+        print(f"Average Verify Time: {summary['avg_verify_time']*1000:.2f}ms")
+        print("="*70 + "\n")
 
 
 class VocalNetSpeculativeDecoding:
@@ -250,7 +261,7 @@ class VocalNetSpeculativeDecoding:
             
             # 为target model分配GPU
             target_device_map = infer_auto_device_map(self.target_model, max_memory={
-                0: "45GiB", 3: "45GiB", 6: "45GiB"#, 6: "45GiB"
+                0: "45GiB", 6: "45GiB"#, 6: "45GiB"
             })
             self.target_model = dispatch_model(self.target_model, device_map=target_device_map)
             
@@ -311,25 +322,26 @@ class VocalNetSpeculativeDecoding:
     def set_audio_dir(self, audio_dir):
         self.audio_dir = audio_dir
 
-    def _draft_generate(self, input_ids, speech_tensor, speech_length, num_tokens):
+    def _draft_generate(self, input_ids, speech_tensor, speech_length, num_tokens,**kwargs):
         """使用draft model生成候选tokens"""
         start_time = time.time()
         with torch.inference_mode():
             if self.s2s:
-                outputs = self.draft_model.generate(
+                outputs,segment_seq,units_pred_list,units_pred,tot_logit = self.draft_model.draft_generate(
                     input_ids,
                     speech=speech_tensor,
                     speech_lengths=speech_length,
+                    streaming_unit_gen=False,
                     do_sample=False,  # 使用贪心解码
                     num_beams=1,
-                    max_new_tokens=num_tokens,
+                    max_audio_tokens=num_tokens,
                     use_cache=True,
                     pad_token_id=128004,
-                    streaming_unit_gen=False,
-                    infer_mtp_token_num=2,
+                    infer_mtp_token_num=0,
                     streaming=False,
+                    **kwargs
                 )
-                output_ids, output_units = outputs
+                
             else:
                 outputs = self.draft_model.generate(
                     input_ids,
@@ -343,51 +355,10 @@ class VocalNetSpeculativeDecoding:
                 )
                 output_ids = outputs
                 output_units = None
-        
+        #tot_logit is draft model's logit
         draft_time = time.time() - start_time
-        return output_ids, output_units, draft_time
-    '''
-    def _verify_with_target(self, input_ids, speech_tensor, speech_length, draft_tokens):
-        """使用target model验证draft tokens"""
-        start_time = time.time()
-        
-        # 将draft tokens作为输入的一部分
-        extended_input_ids = torch.cat([input_ids, draft_tokens], dim=1)
-        
-        with torch.inference_mode():
-            if self.s2s:
-                outputs = self.target_model.generate(
-                    extended_input_ids,
-                    speech=speech_tensor,
-                    speech_lengths=speech_length,
-                    do_sample=False,
-                    num_beams=1,
-                    max_new_tokens=1,  # 只生成一个token来验证
-                    use_cache=True,
-                    pad_token_id=128004,
-                    streaming_unit_gen=False,
-                    infer_mtp_token_num=2,
-                    streaming=False,
-                )
-                output_ids, output_units = outputs
-            else:
-                outputs = self.target_model.generate(
-                    extended_input_ids,
-                    speech=speech_tensor,
-                    speech_lengths=speech_length,
-                    do_sample=False,
-                    num_beams=1,
-                    max_new_tokens=1,
-                    use_cache=True,
-                    pad_token_id=128004,
-                )
-                output_ids = outputs
-                output_units = None
-        
-        verify_time = time.time() - start_time
-        return output_ids, output_units, verify_time
-    '''
-    def _verify_with_target(self, input_ids, speech_tensor, speech_length, draft_tokens):
+        return outputs,segment_seq,units_pred_list,units_pred,tot_logit, draft_time
+    def _verify_with_target(self, input_ids, speech_tensor, speech_length, draft_tokens,audio_unit_list):
         """
         用 target 的 forward logits 来验证 draft_tokens，返回：
         - accepted_count: 接受的前缀长度
@@ -396,57 +367,22 @@ class VocalNetSpeculativeDecoding:
         """
         start_time = time.time()
 
-        # cand = [input + draft_tokens]
-        cand = torch.cat([input_ids, draft_tokens], dim=1)
+        
 
         with torch.inference_mode():
-            out = self.target_model(
-                input_ids=cand,
-                speech=speech_tensor,
-                speech_lengths=speech_length,
-                use_cache=False,
-            )
-
-        # 取 logits
-        logits = out.logits if hasattr(out, "logits") else out[0]  # 兜底：有些模型返回 tuple
-        # logits: [B, T, V]
-
-        in_len = input_ids.shape[1]
-        k = draft_tokens.shape[1]
-
-        accepted = 0
-        for i in range(k):
-            # 位置对齐：logits[:, t, :] 预测的是 token(t+1)
-            # draft_tokens 的第 i 个 token 位于 cand 的 index = in_len + i
-            pos = in_len + i
-            pred = torch.argmax(logits[:, pos - 1, :], dim=-1)  # 预测 cand[pos]
-            if int(pred.item()) == int(draft_tokens[0, i].item()):
-                accepted += 1
-            else:
-                break
-
-        # 第一个不匹配位置 target 的 token（用于纠错推进）
-        if accepted < k:
-            mismatch_pos = in_len + accepted
-            fix_token = torch.argmax(logits[:, mismatch_pos - 1, :], dim=-1)  # 预测 cand[mismatch_pos]
-        else:
-            # 全接受时，需要再 forward 一次才能得到“下一个 token”
-            # 这里简单起见返回 None，让外层下一轮继续
-            fix_token = None
+            test_logit=self.target_model.verify_with_draft(
+            input_ids,
+            speech_tensor,
+            speech_length,
+            draft_tokens=draft_tokens,
+            #draft_seq_list,
+            audio_unit_list=audio_unit_list,
+            infer_mtp_token_num=0,)
 
         verify_time = time.time() - start_time
-        return accepted, fix_token, verify_time
+        return test_logit, verify_time
 
-    def _count_accepted_tokens(self, draft_tokens, target_tokens):
-        """计算target model接受了多少个draft tokens"""
-        # 简化版本：比较draft和target生成的tokens
-        # 实际应该逐个token比较，直到第一个不匹配
-        min_len = min(draft_tokens.shape[1], target_tokens.shape[1])
-        
-        for i in range(min_len):
-            if draft_tokens[0, i] != target_tokens[0, i]:
-                return i
-        return min_len
+    
 
     def __call__(self, messages: list) -> dict:
         """
@@ -484,90 +420,55 @@ class VocalNetSpeculativeDecoding:
         # 投机解码循环
         generated_tokens = []
         generated_units = [] if self.s2s else None
-        current_input_ids = input_ids
+        #breakpoint()
+        outputs,segment_seq,units_pred_list,units_pred,tot_logit, draft_time=self._draft_generate(input_ids, speech_tensor, speech_length, self.k,max_new_tokens=1024)
+        if len(units_pred_list)<=2:
+            raise Exception("audio unit list did not generate any useful token!")
         
-        total_tokens_needed = self.max_new_tokens
-        
-        while len(generated_tokens) < total_tokens_needed:
-            # Step 1: Draft model生成k个候选tokens
-            draft_output_ids, draft_output_units, draft_time = self._draft_generate(
-                current_input_ids, speech_tensor, speech_length, self.k
-            )
-            #breakpoint()
-            # 提取新生成的tokens (排除输入部分)
-            new_draft_tokens = draft_output_ids#[:, current_input_ids.shape[1]:]
-            
-            # Step 2: Target model验证
-            target_output_ids, target_output_units, verify_time = self._verify_with_target(
-                current_input_ids, speech_tensor, speech_length, new_draft_tokens
-            )
-            
-            # 提取target生成的tokens
-            new_target_tokens = target_output_ids#[:, current_input_ids.shape[1]:]
-            
-            # Step 3: 计算接受了多少tokens
-            accepted_count = self._count_accepted_tokens(new_draft_tokens, new_target_tokens)
-            
-            # 更新统计信息
-            self.stats.update(
-                draft_tokens=new_draft_tokens.shape[1],
-                accepted_tokens=accepted_count,
-                draft_time=draft_time,
-                verify_time=verify_time
-            )
-            
-            # 添加接受的tokens
-            if accepted_count > 0:
-                generated_tokens.extend(new_draft_tokens[0, :accepted_count].tolist())
-                if self.s2s and draft_output_units is not None:
-                    new_units = draft_output_units[:, 1:accepted_count+1]  # 跳过第一个token
-                    generated_units.extend(new_units[0].tolist())
-            
-            # 更新当前输入
-            current_input_ids = torch.cat([
-                current_input_ids, 
-                new_draft_tokens[:, :accepted_count]
-            ], dim=1)
-            
-            # 如果没有接受任何token，使用target model的下一个token
-            if accepted_count == 0:
-                generated_tokens.append(new_target_tokens[0, 0].item())
-                current_input_ids = torch.cat([
-                    current_input_ids,
-                    new_target_tokens[:, :1]
-                ], dim=1)
-                if self.s2s and target_output_units is not None:
-                    generated_units.append(target_output_units[0, 1].item())
-            
-            print(f"Iteration: Draft={new_draft_tokens.shape[1]}, Accepted={accepted_count}, "
-                  f"Draft time={draft_time*1000:.2f}ms, Verify time={verify_time*1000:.2f}ms")
+        #cut sos and eos
+        units_pred_list=[units_pred_list[i] for i in range(1,len(units_pred_list)-1)]
+        test_logit,verify_time=self._verify_with_target(input_ids, speech_tensor, speech_length, outputs,units_pred_list)
+        #breakpoint()
+        assert len(test_logit)==len(tot_logit)
+        acceptance_probs = torch.zeros(self.k, device='cuda')
+        offset=0
+        for i in range(len(test_logit)):
+            assert len(test_logit[i])==len(tot_logit[i])
+            for j in range(len(test_logit[i])):
+                if i>0:
+                    offset+=len(test_logit[i-1])
+                draft_probs = F.softmax(torch.tensor(tot_logit[i][j]), dim=-1)
+                target_probs = F.softmax(torch.tensor(test_logit[i][j]), dim=-1)
+                #breakpoint()
+                # 获取draft token的概率
+                token_id = units_pred_list[i][0][j].item()
+                q_x = draft_probs[token_id].item()
+                p_x = target_probs[token_id].item()
+                
+                # 计算接受概率
+                if q_x <= p_x:
+                    accept_prob = 1.0
+                else:
+                    accept_prob = p_x / (q_x + 1e-10)
+                acceptance_probs[offset+j] = accept_prob
+        expected_accepted = 0.0
+        cumulative_prob = 1.0
+        for i in range(self.k):
+            cumulative_prob *= acceptance_probs[i].item()
+            expected_accepted += cumulative_prob
+        self.stats.update(
+            num_audio_tokens=self.k,
+            expected_accepted=expected_accepted,
+            draft_time=draft_time,  # 你已经记录的draft时间
+            verify_time=verify_time  # 你已经记录的verify时间
+        )
 
-        # 解码文本
-        output_text = self.target_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-        
-        result = {"text": output_text}
-        
-        if not self.s2s or generated_units is None:
-            return result
-        
-        # 生成音频
-        output_units_tensor = torch.tensor([generated_units], dtype=torch.int32).to('cuda')
-        
-        for output in self.cosy_vocoder.inference_zero_shot(
-            speech_token=output_units_tensor,
-            prompt_token=self.prompt_token,
-            prompt_feat=self.speech_feat,
-            embedding=self.embedding,
-            stream=False,
-            speed=1
-        ):
-            speech = output['tts_speech']
-            base_name = os.path.basename(audio_path)
-            audio_file = os.path.join(self.audio_dir, f"{base_name.replace('.mp3', '_speculative.wav')}")
-            torchaudio.save(audio_file, speech.cpu(), self.cosy_vocoder.sample_rate)
-            result['audio'] = audio_file
-        
-        return result
+        # 返回结果
+        return {
+            'num_audio_tokens': self.k,
+            'expected_accepted': expected_accepted,
+            'acceptance_rate': expected_accepted / self.k if self.k > 0 else 0
+        }
 
 
 if __name__ == "__main__":

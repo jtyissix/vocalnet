@@ -4,7 +4,7 @@ import json
 import pandas as pd
 from pathlib import Path
 import matplotlib.pyplot as plt
-import seaborn as sns
+import numpy as np
 
 sys.path.insert(0, '/home/jiangtianyuan/resource/voice/vocalnet/')
 sys.path.append('/home/jiangtianyuan/resource/voice/vocalnet/')
@@ -14,42 +14,39 @@ from vocalnet_speculative_decoding import VocalNetSpeculativeDecoding, DRAFT_MOD
 
 def test_speculative_decoding_batch(
     audio_files: list,
-    k_values: list = [3, 5, 7, 10],
-    save_dir: str = "./speculative_results",
-    max_new_tokens: int = 512
+    k_values: list = [3, 5, 7, 15],
+    save_dir: str = "./audio_acceptance_results"
 ):
     """
-    批量测试不同k值下的投机解码性能
+    批量测试不同k值下的audio token接受概率
     
     Args:
         audio_files: 音频文件路径列表
-        k_values: 要测试的k值列表 (每次draft生成的token数)
+        k_values: 要测试的k值列表 (每次draft生成的text token数)
         save_dir: 结果保存目录
-        max_new_tokens: 最大生成token数
     """
     os.makedirs(save_dir, exist_ok=True)
     
     all_results = []
     
     for k in k_values:
-        print(f"\n{'='*60}")
-        print(f"Testing with k={k}")
-        print(f"{'='*60}")
+        print(f"\n{'='*70}")
+        print(f"Testing with k={k} (text tokens)")
+        print(f"{'='*70}")
         
         # 初始化模型
         vocalnet = VocalNetSpeculativeDecoding(
             draft_model_path=DRAFT_MODEL_PATH,
             target_model_path=TARGET_MODEL_PATH,
             k=k,
-            s2s=True,
-            max_new_tokens=max_new_tokens
+            s2s=True
         )
         
         vocalnet.__initialize__()
         audio_save_dir = os.path.join(save_dir, f"k_{k}")
         os.makedirs(audio_save_dir, exist_ok=True)
         vocalnet.set_audio_dir(audio_save_dir)
-        breakpoint()
+        
         for audio_file in audio_files:
             if not os.path.exists(audio_file):
                 print(f"Warning: {audio_file} not found, skipping...")
@@ -62,135 +59,201 @@ def test_speculative_decoding_batch(
                 response = vocalnet(audio_messages)
                 stats = vocalnet.stats.get_summary()
                 
+                # 收集每个样本的结果
                 result = {
                     'audio_file': os.path.basename(audio_file),
                     'k': k,
-                    'acceptance_rate': stats['acceptance_rate'],
-                    'total_draft_tokens': stats['total_draft_tokens'],
-                    'total_accepted_tokens': stats['total_accepted_tokens'],
-                    'num_iterations': stats['num_iterations'],
-                    'avg_accepted_per_iteration': stats['avg_accepted_per_iteration'],
-                    'avg_draft_time_ms': stats['avg_draft_time'] * 1000,
-                    'avg_verify_time_ms': stats['avg_verify_time'] * 1000,
-                    'generated_text': response['text']
+                    'acceptance_rate': stats['avg_acceptance_rate'],
+                    'expected_accepted': stats['avg_expected_accepted'],
+                    'num_audio_tokens': stats['avg_num_audio_tokens'],
+                    'draft_time_ms': stats['avg_draft_time'] * 1000,
+                    'verify_time_ms': stats['avg_verify_time'] * 1000,
                 }
                 
                 all_results.append(result)
                 
-                print(f"  Acceptance Rate: {stats['acceptance_rate']*100:.2f}%")
-                print(f"  Iterations: {stats['num_iterations']}")
-                print(f"  Avg Accepted/Iter: {stats['avg_accepted_per_iteration']:.2f}")
+                print(f"  Audio Tokens: {result['num_audio_tokens']:.0f}")
+                print(f"  Expected Accepted: {result['expected_accepted']:.2f}")
+                print(f"  Acceptance Rate: {result['acceptance_rate']*100:.2f}%")
                 
                 # 重置统计信息
                 vocalnet.stats = type(vocalnet.stats)()
                 
             except Exception as e:
                 print(f"Error processing {audio_file}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 continue
     
     # 保存结果
-    results_df = pd.DataFrame(all_results)
-    results_csv = os.path.join(save_dir, "speculative_decoding_results.csv")
-    results_df.to_csv(results_csv, index=False)
-    print(f"\nResults saved to: {results_csv}")
-    
-    # 生成统计报告
-    generate_analysis_report(results_df, save_dir)
-    
-    return results_df
+    if all_results:
+        df = pd.DataFrame(all_results)
+        results_csv = os.path.join(save_dir, "audio_acceptance_results.csv")
+        df.to_csv(results_csv, index=False)
+        print(f"\nResults saved to: {results_csv}")
+        
+        # 生成统计报告
+        generate_analysis_report(df, save_dir)
+        
+        return df
+    else:
+        print("No results to save!")
+        return None
 
 
 def generate_analysis_report(df: pd.DataFrame, save_dir: str):
     """生成详细的分析报告"""
     
-    # 1. 按k值分组统计
-    print("\n" + "="*60)
-    print("Summary Statistics by k")
-    print("="*60)
+    print("\n" + "="*70)
+    print("Audio Token Acceptance Test Results")
+    print("="*70)
     
-    summary_by_k = df.groupby('k').agg({
+    # 按k值分组统计
+    summary = df.groupby('k').agg({
         'acceptance_rate': ['mean', 'std', 'min', 'max'],
-        'avg_accepted_per_iteration': ['mean', 'std'],
-        'num_iterations': ['mean', 'std'],
-        'avg_draft_time_ms': 'mean',
-        'avg_verify_time_ms': 'mean'
+        'expected_accepted': ['mean', 'std', 'min', 'max'],
+        'num_audio_tokens': ['mean', 'std'],
+        'draft_time_ms': 'mean',
+        'verify_time_ms': 'mean'
     }).round(4)
     
-    print(summary_by_k)
+    print("\n=== Summary by k (重点指标) ===")
+    print(summary)
     
     # 保存统计表格
-    summary_by_k.to_csv(os.path.join(save_dir, "summary_by_k.csv"))
+    summary.to_csv(os.path.join(save_dir, "summary_by_k.csv"))
     
-    # 2. 生成可视化图表
+    # 打印重点统计
+    print("\n" + "="*70)
+    print("KEY METRICS BY k")
+    print("="*70)
+    for k in sorted(df['k'].unique()):
+        k_data = df[df['k'] == k]
+        print(f"\nk = {k}:")
+        print(f"  平均接受率: {k_data['acceptance_rate'].mean()*100:.2f}% (±{k_data['acceptance_rate'].std()*100:.2f}%)")
+        print(f"  平均期望接受数: {k_data['expected_accepted'].mean():.2f} (±{k_data['expected_accepted'].std():.2f})")
+        print(f"  平均audio token数: {k_data['num_audio_tokens'].mean():.1f}")
+        print(f"  效率: {(k_data['expected_accepted'].mean()/k_data['num_audio_tokens'].mean())*100:.1f}%")
+    
+    # 生成可视化
     generate_visualizations(df, save_dir)
     
-    # 3. 生成文本报告
-    generate_text_report(df, summary_by_k, save_dir)
+    # 生成文本报告
+    generate_text_report(df, summary, save_dir)
 
 
 def generate_visualizations(df: pd.DataFrame, save_dir: str):
-    """生成可视化图表"""
+    """生成可视化图表 - 重点展示接受率和期望长度"""
     
-    plt.style.use('seaborn-v0_8-darkgrid')
-    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig = plt.figure(figsize=(16, 10))
+    gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
     
-    # 1. 接受率 vs k值
-    ax1 = axes[0, 0]
     k_values = sorted(df['k'].unique())
+    
+    # 1. 接受率 vs k值 (左上)
+    ax1 = fig.add_subplot(gs[0, 0])
     acceptance_rates = [df[df['k']==k]['acceptance_rate'].mean() for k in k_values]
     acceptance_stds = [df[df['k']==k]['acceptance_rate'].std() for k in k_values]
     
     ax1.errorbar(k_values, acceptance_rates, yerr=acceptance_stds, marker='o', 
-                 capsize=5, capthick=2, linewidth=2, markersize=8)
-    ax1.set_xlabel('k (Draft Tokens per Iteration)', fontsize=12)
-    ax1.set_ylabel('Acceptance Rate', fontsize=12)
-    ax1.set_title('Acceptance Rate vs k', fontsize=14, fontweight='bold')
-    ax1.grid(True, alpha=0.3)
+                 capsize=5, capthick=2, linewidth=2, markersize=10, color='#2E86AB')
+    ax1.set_xlabel('k (Text Tokens)', fontsize=13, fontweight='bold')
+    ax1.set_ylabel('Acceptance Rate', fontsize=13, fontweight='bold')
+    ax1.set_title('平均接受率 vs k', fontsize=15, fontweight='bold', pad=10)
+    ax1.grid(True, alpha=0.3, linestyle='--')
     ax1.set_ylim([0, 1])
+    for i, (k, rate) in enumerate(zip(k_values, acceptance_rates)):
+        ax1.text(k, rate + 0.03, f'{rate*100:.1f}%', ha='center', fontsize=10, fontweight='bold')
     
-    # 2. 每次迭代接受的平均token数 vs k值
-    ax2 = axes[0, 1]
-    avg_accepted = [df[df['k']==k]['avg_accepted_per_iteration'].mean() for k in k_values]
-    avg_accepted_stds = [df[df['k']==k]['avg_accepted_per_iteration'].std() for k in k_values]
+    # 2. 期望接受数 vs k值 (右上)
+    ax2 = fig.add_subplot(gs[0, 1])
+    expected_accepted = [df[df['k']==k]['expected_accepted'].mean() for k in k_values]
+    expected_stds = [df[df['k']==k]['expected_accepted'].std() for k in k_values]
+    num_audio_tokens = [df[df['k']==k]['num_audio_tokens'].mean() for k in k_values]
     
-    ax2.errorbar(k_values, avg_accepted, yerr=avg_accepted_stds, marker='s', 
-                 capsize=5, capthick=2, linewidth=2, markersize=8, color='green')
-    ax2.set_xlabel('k (Draft Tokens per Iteration)', fontsize=12)
-    ax2.set_ylabel('Avg Accepted Tokens per Iteration', fontsize=12)
-    ax2.set_title('Efficiency vs k', fontsize=14, fontweight='bold')
-    ax2.grid(True, alpha=0.3)
+    ax2.errorbar(k_values, expected_accepted, yerr=expected_stds, marker='s', 
+                 capsize=5, capthick=2, linewidth=2, markersize=10, color='#06A77D', 
+                 label='Expected Accepted')
+    ax2.plot(k_values, num_audio_tokens, 'r--', marker='^', linewidth=2, markersize=10, 
+             alpha=0.7, label='Total Audio Tokens')
+    ax2.set_xlabel('k (Text Tokens)', fontsize=13, fontweight='bold')
+    ax2.set_ylabel('Number of Audio Tokens', fontsize=13, fontweight='bold')
+    ax2.set_title('期望接受数 vs 总token数', fontsize=15, fontweight='bold', pad=10)
+    ax2.legend(fontsize=11, loc='upper left')
+    ax2.grid(True, alpha=0.3, linestyle='--')
+    for i, (k, exp) in enumerate(zip(k_values, expected_accepted)):
+        ax2.text(k, exp + 2, f'{exp:.1f}', ha='center', fontsize=10, fontweight='bold')
     
-    # 3. 时间开销对比
-    ax3 = axes[1, 0]
-    draft_times = [df[df['k']==k]['avg_draft_time_ms'].mean() for k in k_values]
-    verify_times = [df[df['k']==k]['avg_verify_time_ms'].mean() for k in k_values]
-    
-    x = range(len(k_values))
-    width = 0.35
-    ax3.bar([i - width/2 for i in x], draft_times, width, label='Draft Time', alpha=0.8)
-    ax3.bar([i + width/2 for i in x], verify_times, width, label='Verify Time', alpha=0.8)
-    ax3.set_xlabel('k (Draft Tokens per Iteration)', fontsize=12)
-    ax3.set_ylabel('Time (ms)', fontsize=12)
-    ax3.set_title('Average Time Cost per Iteration', fontsize=14, fontweight='bold')
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(k_values)
-    ax3.legend()
-    ax3.grid(True, alpha=0.3, axis='y')
-    
-    # 4. 接受率分布箱线图
-    ax4 = axes[1, 1]
+    # 3. 接受率分布箱线图 (左中)
+    ax3 = fig.add_subplot(gs[1, 0])
     data_for_box = [df[df['k']==k]['acceptance_rate'].values for k in k_values]
-    bp = ax4.boxplot(data_for_box, labels=k_values, patch_artist=True)
-    for patch in bp['boxes']:
-        patch.set_facecolor('lightblue')
-    ax4.set_xlabel('k (Draft Tokens per Iteration)', fontsize=12)
-    ax4.set_ylabel('Acceptance Rate', fontsize=12)
-    ax4.set_title('Acceptance Rate Distribution', fontsize=14, fontweight='bold')
-    ax4.grid(True, alpha=0.3, axis='y')
+    bp = ax3.boxplot(data_for_box, labels=k_values, patch_artist=True,
+                     boxprops=dict(facecolor='lightblue', alpha=0.7),
+                     medianprops=dict(color='red', linewidth=2),
+                     whiskerprops=dict(linewidth=1.5),
+                     capprops=dict(linewidth=1.5))
+    ax3.set_xlabel('k (Text Tokens)', fontsize=13, fontweight='bold')
+    ax3.set_ylabel('Acceptance Rate', fontsize=13, fontweight='bold')
+    ax3.set_title('接受率分布', fontsize=15, fontweight='bold', pad=10)
+    ax3.grid(True, alpha=0.3, axis='y', linestyle='--')
+    ax3.set_ylim([0, 1])
     
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'speculative_decoding_analysis.png'), dpi=300, bbox_inches='tight')
-    print(f"\nVisualization saved to: {os.path.join(save_dir, 'speculative_decoding_analysis.png')}")
+    # 4. 期望接受数分布箱线图 (右中)
+    ax4 = fig.add_subplot(gs[1, 1])
+    data_for_box = [df[df['k']==k]['expected_accepted'].values for k in k_values]
+    bp = ax4.boxplot(data_for_box, labels=k_values, patch_artist=True,
+                     boxprops=dict(facecolor='lightgreen', alpha=0.7),
+                     medianprops=dict(color='red', linewidth=2),
+                     whiskerprops=dict(linewidth=1.5),
+                     capprops=dict(linewidth=1.5))
+    ax4.set_xlabel('k (Text Tokens)', fontsize=13, fontweight='bold')
+    ax4.set_ylabel('Expected Accepted Tokens', fontsize=13, fontweight='bold')
+    ax4.set_title('期望接受数分布', fontsize=15, fontweight='bold', pad=10)
+    ax4.grid(True, alpha=0.3, axis='y', linestyle='--')
+    
+    # 5. 效率对比表格 (底部跨两列)
+    ax5 = fig.add_subplot(gs[2, :])
+    ax5.axis('tight')
+    ax5.axis('off')
+    
+    # 构建表格数据
+    table_data = []
+    table_data.append(['k', 'Acceptance Rate', 'Expected Accepted', 'Audio Tokens', 'Efficiency'])
+    for k in k_values:
+        k_data = df[df['k'] == k]
+        acc_rate = k_data['acceptance_rate'].mean()
+        exp_acc = k_data['expected_accepted'].mean()
+        num_tokens = k_data['num_audio_tokens'].mean()
+        efficiency = exp_acc / num_tokens if num_tokens > 0 else 0
+        table_data.append([
+            f'{k}',
+            f'{acc_rate*100:.2f}%',
+            f'{exp_acc:.2f}',
+            f'{num_tokens:.1f}',
+            f'{efficiency*100:.1f}%'
+        ])
+    
+    table = ax5.table(cellText=table_data, cellLoc='center', loc='center',
+                     colWidths=[0.15, 0.25, 0.25, 0.2, 0.15])
+    table.auto_set_font_size(False)
+    table.set_fontsize(11)
+    table.scale(1, 2)
+    
+    # 设置表头样式
+    for i in range(5):
+        table[(0, i)].set_facecolor('#2E86AB')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # 设置行交替颜色
+    for i in range(1, len(table_data)):
+        for j in range(5):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#F0F0F0')
+    
+    plt.suptitle('Audio Token 投机解码接受概率分析', fontsize=18, fontweight='bold', y=0.98)
+    
+    plt.savefig(os.path.join(save_dir, 'audio_acceptance_analysis.png'), dpi=300, bbox_inches='tight')
+    print(f"\nVisualization saved to: {os.path.join(save_dir, 'audio_acceptance_analysis.png')}")
     plt.close()
 
 
@@ -201,54 +264,79 @@ def generate_text_report(df: pd.DataFrame, summary: pd.DataFrame, save_dir: str)
     
     with open(report_path, 'w', encoding='utf-8') as f:
         f.write("="*70 + "\n")
-        f.write("Speculative Decoding Analysis Report\n")
+        f.write("Audio Token 投机解码接受概率测试报告\n")
         f.write("Draft Model: 1B | Target Model: 8B\n")
         f.write("="*70 + "\n\n")
         
-        # 整体统计
-        f.write("Overall Statistics:\n")
+        f.write("测试说明:\n")
         f.write("-" * 70 + "\n")
-        f.write(f"Total samples tested: {len(df)}\n")
-        f.write(f"k values tested: {sorted(df['k'].unique())}\n")
-        f.write(f"Overall average acceptance rate: {df['acceptance_rate'].mean()*100:.2f}%\n")
-        f.write(f"Best k value (by acceptance rate): k={df.groupby('k')['acceptance_rate'].mean().idxmax()}\n")
-        f.write(f"Best k value (by efficiency): k={df.groupby('k')['avg_accepted_per_iteration'].mean().idxmax()}\n")
-        f.write("\n")
+        f.write("本测试评估draft model生成的audio tokens被target model接受的概率\n")
+        f.write("使用标准投机解码验证逻辑: accept_prob = min(1, p(x)/q(x))\n")
+        f.write("k = draft model生成的text token数量\n")
+        f.write("期望接受数 = 考虑前缀性质的累积接受概率\n\n")
         
-        # 按k值详细统计
-        f.write("Detailed Statistics by k:\n")
+        f.write("整体统计:\n")
         f.write("-" * 70 + "\n")
+        f.write(f"测试样本数: {len(df)}\n")
+        f.write(f"测试的k值: {sorted(df['k'].unique())}\n")
+        f.write(f"总体平均接受率: {df['acceptance_rate'].mean()*100:.2f}%\n")
+        f.write(f"总体平均期望接受数: {df['expected_accepted'].mean():.2f}\n\n")
+        
+        f.write("="*70 + "\n")
+        f.write("各k值详细统计\n")
+        f.write("="*70 + "\n\n")
         
         for k in sorted(df['k'].unique()):
             k_data = df[df['k'] == k]
-            f.write(f"\nk = {k}:\n")
-            f.write(f"  Acceptance Rate: {k_data['acceptance_rate'].mean()*100:.2f}% ")
-            f.write(f"(±{k_data['acceptance_rate'].std()*100:.2f}%)\n")
-            f.write(f"  Avg Accepted per Iteration: {k_data['avg_accepted_per_iteration'].mean():.2f} ")
-            f.write(f"(±{k_data['avg_accepted_per_iteration'].std():.2f})\n")
-            f.write(f"  Avg Iterations: {k_data['num_iterations'].mean():.1f}\n")
-            f.write(f"  Avg Draft Time: {k_data['avg_draft_time_ms'].mean():.2f}ms\n")
-            f.write(f"  Avg Verify Time: {k_data['avg_verify_time_ms'].mean():.2f}ms\n")
-            f.write(f"  Speedup potential: {k_data['avg_accepted_per_iteration'].mean():.2f}x per iteration\n")
+            f.write(f"k = {k} (text tokens):\n")
+            f.write("-" * 70 + "\n")
+            f.write(f"  样本数量: {len(k_data)}\n")
+            f.write(f"  \n")
+            f.write(f"  【接受率】\n")
+            f.write(f"    平均值: {k_data['acceptance_rate'].mean()*100:.2f}%\n")
+            f.write(f"    标准差: {k_data['acceptance_rate'].std()*100:.2f}%\n")
+            f.write(f"    最小值: {k_data['acceptance_rate'].min()*100:.2f}%\n")
+            f.write(f"    最大值: {k_data['acceptance_rate'].max()*100:.2f}%\n")
+            f.write(f"  \n")
+            f.write(f"  【期望接受数】\n")
+            f.write(f"    平均值: {k_data['expected_accepted'].mean():.2f} tokens\n")
+            f.write(f"    标准差: {k_data['expected_accepted'].std():.2f}\n")
+            f.write(f"    最小值: {k_data['expected_accepted'].min():.2f}\n")
+            f.write(f"    最大值: {k_data['expected_accepted'].max():.2f}\n")
+            f.write(f"  \n")
+            f.write(f"  【Audio Token数量】\n")
+            f.write(f"    平均值: {k_data['num_audio_tokens'].mean():.1f} tokens\n")
+            f.write(f"    标准差: {k_data['num_audio_tokens'].std():.1f}\n")
+            f.write(f"  \n")
+            f.write(f"  【效率】\n")
+            efficiency = k_data['expected_accepted'].mean() / k_data['num_audio_tokens'].mean() if k_data['num_audio_tokens'].mean() > 0 else 0
+            f.write(f"    接受效率: {efficiency*100:.1f}%\n")
+            f.write(f"    (期望接受数 / 总audio tokens)\n")
+            f.write(f"  \n")
+            f.write(f"  【时间开销】\n")
+            f.write(f"    Draft平均时间: {k_data['draft_time_ms'].mean():.2f}ms\n")
+            f.write(f"    Verify平均时间: {k_data['verify_time_ms'].mean():.2f}ms\n")
+            f.write("\n")
         
-        f.write("\n" + "="*70 + "\n")
-        f.write("Recommendations:\n")
-        f.write("-" * 70 + "\n")
+        f.write("="*70 + "\n")
+        f.write("结论与建议\n")
+        f.write("="*70 + "\n")
         
-        best_k = df.groupby('k')['acceptance_rate'].mean().idxmax()
+        best_k_rate = df.groupby('k')['acceptance_rate'].mean().idxmax()
         best_rate = df.groupby('k')['acceptance_rate'].mean().max()
-        f.write(f"1. Optimal k value: k={best_k} with {best_rate*100:.2f}% acceptance rate\n")
+        best_k_exp = df.groupby('k')['expected_accepted'].mean().idxmax()
+        best_exp = df.groupby('k')['expected_accepted'].mean().max()
         
-        efficiency_k = df.groupby('k')['avg_accepted_per_iteration'].mean().idxmax()
-        efficiency_val = df.groupby('k')['avg_accepted_per_iteration'].mean().max()
-        f.write(f"2. Best efficiency: k={efficiency_k} with {efficiency_val:.2f} tokens accepted per iteration\n")
+        f.write(f"1. 最高接受率: k={best_k_rate}, 接受率={best_rate*100:.2f}%\n")
+        f.write(f"2. 最高期望接受数: k={best_k_exp}, 期望接受={best_exp:.2f} tokens\n")
+        f.write(f"\n")
         
-        if best_rate > 0.7:
-            f.write("3. High acceptance rate achieved! Speculative decoding is effective.\n")
-        elif best_rate > 0.5:
-            f.write("3. Moderate acceptance rate. Consider tuning or using smaller k values.\n")
+        if best_rate > 0.8:
+            f.write("3. 评估: 接受率很高，投机解码效果优秀\n")
+        elif best_rate > 0.6:
+            f.write("3. 评估: 接受率良好，投机解码有明显效果\n")
         else:
-            f.write("3. Low acceptance rate. Draft model may be too different from target model.\n")
+            f.write("3. 评估: 接受率较低，可能需要优化draft model或调整k值\n")
     
     print(f"Text report saved to: {report_path}")
 
@@ -256,19 +344,17 @@ def generate_text_report(df: pd.DataFrame, summary: pd.DataFrame, save_dir: str)
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description='Batch test speculative decoding')
-    parser.add_argument('--audio_dir', type=str, required=True, 
-                        help='Directory containing audio files to test')
+    parser = argparse.ArgumentParser(description='Batch Audio Token Acceptance Test')
+    parser.add_argument('--audio_dir', type=str, required=True,
+                        help='Directory containing audio files')
     parser.add_argument('--audio_list', type=str, default=None,
-                        help='Text file containing list of audio paths (one per line)')
-    parser.add_argument('--k_values', type=int, nargs='+', default=[3, 5, 7, 10],
-                        help='List of k values to test')
-    parser.add_argument('--save_dir', type=str, default='./speculative_results',
+                        help='Text file containing list of audio paths')
+    parser.add_argument('--k_values', type=int, nargs='+', default=[3, 5, 7, 15],
+                        help='List of k values (text tokens) to test')
+    parser.add_argument('--save_dir', type=str, default='./audio_acceptance_results',
                         help='Directory to save results')
     parser.add_argument('--max_samples', type=int, default=None,
                         help='Maximum number of samples to test')
-    parser.add_argument('--max_new_tokens', type=int, default=512,
-                        help='Maximum number of tokens to generate')
     
     args = parser.parse_args()
     
@@ -287,21 +373,20 @@ if __name__ == "__main__":
         audio_files = audio_files[:args.max_samples]
     
     print(f"Found {len(audio_files)} audio files to test")
-    print(f"Testing k values: {args.k_values}")
+    print(f"Testing k values (text tokens): {args.k_values}")
     
     if len(audio_files) == 0:
         print("No audio files found!")
         exit(1)
     
-    # 运行批量测试
-    results_df = test_speculative_decoding_batch(
+    # 运行测试
+    df = test_speculative_decoding_batch(
         audio_files=audio_files,
         k_values=args.k_values,
-        save_dir=args.save_dir,
-        max_new_tokens=args.max_new_tokens
+        save_dir=args.save_dir
     )
     
     print("\n" + "="*70)
-    print("Batch testing completed!")
+    print("Testing completed!")
     print(f"Results saved to: {args.save_dir}")
     print("="*70)

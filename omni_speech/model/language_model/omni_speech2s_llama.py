@@ -122,7 +122,13 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
 
     def get_speech_decoder(self):  
         return self.speech_generator
-
+    def get_curr_num_tokens(self,units_pred_list):
+        if len(units_pred_list)==1:
+            return 0
+        num=0
+        for i in range(1,len(units_pred_list)):
+            num+=units_pred_list[i].shape[1]
+        return num
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -319,6 +325,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         streaming_unit_gen=False,
         infer_mtp_token_num=0,
         streaming=False,
+        max_audio_tokens=4096,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -383,7 +390,10 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         segment_seq = [outputs['sequences'][:, filter_stop_token_indices[i]:filter_stop_token_indices[i+1]] for i in range(len(filter_stop_token_indices) - 1)]
         tot_logit=[]
         units_pred_list = [torch.tensor([[self.config.speech_sos_token_id]], device=hidden_states.device)]
+        #这个predict的max token是针对每一个chunk的，对于全局要生成指定token数需要每个chunk统计并从预算中减去
+        token_budget=max_audio_tokens
         for hidden in hidden_states_list:
+            token_budget-=self.get_curr_num_tokens(units_pred_list)
             if infer_mtp_token_num > 0:
                 if streaming:
                     units_pred_list.append(self.speech_generator.pseudo_streaming_predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
@@ -392,14 +402,19 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                     units_pred_list.append(self.speech_generator.predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
             else:
                 #breakpoint()
-                tok,logit=self.speech_generator.predict(hidden,require_logits=True)
-                units_pred_list.append(tok[:,1:-1])
-                tot_logit.append(logit)
+                tok,logit=self.speech_generator.predict(hidden,require_logits=True,max_tokens=token_budget)
+                if tok[0][-1]==self.config.speech_eos_token_id:
+                    units_pred_list.append(tok[:,1:-1])
+                    logit.pop()
+                    tot_logit.append(logit)
+                else:
+                    units_pred_list.append(tok[:,1:])
+                    tot_logit.append(logit)
                 #units_pred_list.append(self.speech_generator.predict(hidden)[:,1:-1])
         units_pred_list.append(torch.tensor([[self.config.speech_eos_token_id]], device=hidden_states.device))
         units_pred = torch.cat(units_pred_list, dim=1).contiguous()
 
-            
+           
         return outputs.sequences,segment_seq,units_pred_list,units_pred,tot_logit
         #return outputs.sequences, units_pred
     @torch.no_grad()
@@ -863,7 +878,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         speech_lengths,
         draft_tokens=segment_seq[0],
         #draft_seq_list,
-        audio_unit_list=[units_pred_list[1][0:2]],
+        audio_unit_list=[units_pred_list[1][:,0:2]],
         infer_mtp_token_num=0,)
         breakpoint()
         return 0

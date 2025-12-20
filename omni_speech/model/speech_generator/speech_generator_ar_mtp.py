@@ -451,7 +451,7 @@ class SpeechGeneratorARMTP(nn.Module):
             if next_token_id == self.eos_token:
                 break
         # pdb.set_trace()
-        breakpoint()
+        #breakpoint()
         if require_logits:
             return generated_tokens,tot_logit
             #this logit:[len(generated_tokens),1,1,logit_width]
@@ -861,7 +861,7 @@ class SpeechGeneratorARMTP(nn.Module):
         cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], \
                                       device=inputs_embeds.device)
         hidden_states = self.transformer_infer(hidden, cache_position, past_key_values)
-        breakpoint()
+        #breakpoint()
         # init generated tokens
         
         cur_token = torch.full((1, 1), self.sos_token, dtype=torch.long, device=hidden.device)
