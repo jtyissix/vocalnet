@@ -528,7 +528,7 @@ class SpeechGeneratorARMTP(nn.Module):
     
             
 
-    def predict_mtp(self, llm_hidden, top_k=1, prefix=None, penalty_window_size=5, penalty=2, max_tokens=2048, infer_mtp_token_num=3):
+    def predict_mtp(self, llm_hidden, top_k=1, prefix=None, penalty_window_size=5, penalty=2, max_tokens=2048, infer_mtp_token_num=3,require_logits=False):
         if infer_mtp_token_num > self.mtp_num:
             raise ValueError("mtp_token_num should be less than mtp_num")
         
@@ -559,8 +559,11 @@ class SpeechGeneratorARMTP(nn.Module):
         cur_chunk_token = torch.full((1, 1), self.sos_token, dtype=torch.long, device=inputs_embeds.device)
         generated_tokens = torch.full((1, 1), self.sos_token, dtype=torch.long, device=inputs_embeds.device)
         # generate tokens
-        while generated_tokens.shape[1] < max_tokens:
-        # for i in range(max_tokens):
+        tot_logit=[]
+        #do not use for control,not correct!
+        #one while pass-->1+ infer_mtp_token_num tokens generated
+        while generated_tokens.shape[1] < max_tokens+1:
+        #for i in range(max_tokens):
             inputs_embeds = self.embedding(cur_chunk_token)
             past_seen_tokens = past_key_values.get_seq_length()
             cache_position = torch.arange(past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device)
@@ -569,7 +572,8 @@ class SpeechGeneratorARMTP(nn.Module):
 
             # Project to vocabulary size
             logits = self.output_proj(norm_hidden_states[:,-1,:].unsqueeze(1))
-
+            temp=logits.squeeze(0).squeeze(0).tolist()
+            tot_logit.append(temp)
             # apply penalty
             if penalty_window_size > 0:
                 for token in set(generated_tokens[0][-penalty_window_size:]):
@@ -602,8 +606,10 @@ class SpeechGeneratorARMTP(nn.Module):
                     past_seen_tokens = mtp_past_key_values[j].get_seq_length()
                     cache_position = torch.arange(past_seen_tokens, past_seen_tokens + mtp_inputs_embeds.shape[1], device=mtp_inputs_embeds.device)
                     hidden_states, logits = self.infer_mtp_layer(self.mtp_layers[j], hidden_states, cache_position, mtp_past_key_values[j])
-
+                    temp=logits.squeeze(0).squeeze(0).tolist()
+                    tot_logit.append(temp)
                     output = logits.squeeze(0).squeeze(0)
+
                     probs = torch.nn.functional.softmax(output, dim=-1)
                     top_k_probs, top_k_indices = torch.topk(probs, top_k)
                     probs = torch.zeros_like(probs).scatter_(0, top_k_indices, top_k_probs)
@@ -624,6 +630,8 @@ class SpeechGeneratorARMTP(nn.Module):
                     hidden_states, logits = self.infer_mtp_layer(self.mtp_layers[j], hidden_states, cache_position, mtp_past_key_values[j])
 
                     logits = logits[:,-1,:]
+                    temp=logits.squeeze(0).squeeze(0).tolist()
+                    tot_logit.append(temp)
                     output = logits.squeeze(0).squeeze(0)
                     probs = torch.nn.functional.softmax(output, dim=-1)
                     top_k_probs, top_k_indices = torch.topk(probs, top_k)
@@ -638,6 +646,8 @@ class SpeechGeneratorARMTP(nn.Module):
                         break
                 if next_token_id == self.eos_token:
                     break
+        if require_logits:
+            return generated_tokens,tot_logit
         return generated_tokens
     
     

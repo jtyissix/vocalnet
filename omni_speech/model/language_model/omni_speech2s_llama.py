@@ -399,7 +399,15 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                     units_pred_list.append(self.speech_generator.pseudo_streaming_predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
                 else:
                     # print("streaming!!")
-                    units_pred_list.append(self.speech_generator.predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
+                    #units_pred_list.append(self.speech_generator.predict_mtp(hidden, infer_mtp_token_num=infer_mtp_token_num)[:,1:-1])
+                    tok,logit=self.speech_generator.predict_mtp(hidden,require_logits=True,max_tokens=token_budget,infer_mtp_token_num=infer_mtp_token_num)
+                    if tok[0][-1]==self.config.speech_eos_token_id:
+                        units_pred_list.append(tok[:,1:-1])
+                        logit.pop()
+                        tot_logit.append(logit)
+                    else:
+                        units_pred_list.append(tok[:,1:])
+                        tot_logit.append(logit)
             else:
                 #breakpoint()
                 tok,logit=self.speech_generator.predict(hidden,require_logits=True,max_tokens=token_budget)
@@ -687,12 +695,10 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                 # 调用verify_mtp
                 #this verify_mtp will be modified later
             
-                segment_logits = self.speech_generator.verify_mtp(
-                    hidden_segment,
-                    audio_unit_list[idx],
-                    infer_mtp_token_num=infer_mtp_token_num
+                segment_logits = self.speech_generator.verify(
+                    hidden_segment,audio_unit_list[idx]
                 )
-                logits_list.extend(segment_logits)
+                logits_list.append(segment_logits)
             else:
                 # 调用verify
                 segment_logits = self.speech_generator.verify(
