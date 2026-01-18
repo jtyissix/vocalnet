@@ -650,7 +650,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         # 提取draft部分的hidden states
         hidden_states = outputs.hidden_states[-1]  # 最后一层
         draft_hidden = hidden_states[:, inputs_embeds.shape[1]-1:-1, :]  # 只要draft部分
-        
+        #这里是否需要先verify一遍？准确率？
         # 按照stop_tokens切分
         stop_tokens = [13, 30, 0, 11]  # , . ! ?
         #here we only divide the generated tokens i.e. draft tokens
