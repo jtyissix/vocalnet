@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import asyncio
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaConfig, LlamaRMSNorm, LlamaRotaryEmbedding
 from omni_speech.constants import IGNORE_INDEX
 import copy
@@ -836,7 +836,8 @@ class SpeechGeneratorARMTP(nn.Module):
         
         return generated_tokens
         
-
+    async def streaming_predict_mtp_async(self, *args, **kwargs):
+        return await asyncio.to_thread(self.streaming_predict_mtp, *args, **kwargs)
     def reset_streaming_cache(self):
         self._prenn_past_key_values = DynamicCache.from_legacy_cache(None)
         self._speech_decoder_past_key_values = {

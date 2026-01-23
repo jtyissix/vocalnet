@@ -52,7 +52,7 @@ except ImportError:
 class SpeechTokenizer:
     def __init__(self, speech_tokenizer_model: str, feat_extractor: Callable, get_tokenizer: Callable, 
                  campplus_model: str, allowed_special: str = 'all',device: str = None):
-        self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
+        self.device = torch.device(device if device else ('cuda:1' if torch.cuda.is_available() else 'cpu'))
         self.tokenizer = get_tokenizer()
         self.allowed_special = allowed_special
         option = onnxruntime.SessionOptions()
@@ -250,7 +250,7 @@ class VocalNetSpeculativeDecoding:
             
             # 为draft model分配GPU
             draft_device_map = infer_auto_device_map(self.draft_model, max_memory={
-                0: "45GiB", 6: "45GiB" # draft model用较少的显存
+                1: "45GiB", 6: "45GiB" # draft model用较少的显存
             })
             self.draft_model = dispatch_model(self.draft_model, device_map=draft_device_map)
             
@@ -261,7 +261,7 @@ class VocalNetSpeculativeDecoding:
             
             # 为target model分配GPU
             target_device_map = infer_auto_device_map(self.target_model, max_memory={
-                0: "45GiB", 6: "45GiB"#, 6: "45GiB"
+                1: "45GiB", 6: "45GiB"#, 6: "45GiB"
             })
             self.target_model = dispatch_model(self.target_model, device_map=target_device_map)
             
@@ -413,9 +413,9 @@ class VocalNetSpeculativeDecoding:
             input_ids = preprocess_llama_3_v1([conversation], self.target_tokenizer, True, 4096)['input_ids']
             input_ids = torch.cat([input_ids.squeeze(), torch.tensor([128006, 78191, 128007, 271], device=input_ids.device)]).unsqueeze(0)
 
-        input_ids = input_ids.to(device='cuda', non_blocking=True)
-        speech_tensor = speech.to(dtype=torch.float16, device='cuda', non_blocking=True)
-        speech_length = speech_length.to(device='cuda', non_blocking=True)
+        input_ids = input_ids.to(device='cuda:1', non_blocking=True)
+        speech_tensor = speech.to(dtype=torch.float16, device='cuda:1', non_blocking=True)
+        speech_length = speech_length.to(device='cuda:1', non_blocking=True)
 
         # 投机解码循环
         generated_tokens = []
@@ -430,7 +430,7 @@ class VocalNetSpeculativeDecoding:
         test_logit,verify_time=self._verify_with_target(input_ids, speech_tensor, speech_length, outputs,units_pred_list)
         #breakpoint()
         assert len(test_logit)==len(tot_logit)
-        acceptance_probs = torch.zeros(self.k, device='cuda')
+        acceptance_probs = torch.zeros(self.k, device='cuda:1')
         offset=0
         for i in range(len(test_logit)):
             assert len(test_logit[i])==len(tot_logit[i])
