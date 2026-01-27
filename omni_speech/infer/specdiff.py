@@ -35,6 +35,7 @@ import uuid
 import glob
 import pdb
 import subprocess
+import asyncio
 TARGET_MODEL_PATH=""
 DRAFT_MODEL_PATH=""
 COSYVOICE_MODEL=""     ## CosyVoice2-0.5B       i.e. /workspace/CosyVoice/pretrained_models/CosyVoice2-0.5B-VocalNet
@@ -50,6 +51,100 @@ except ImportError:
     from tn.chinese.normalizer import Normalizer as ZhNormalizer
     from tn.english.normalizer import Normalizer as EnNormalizer
     use_ttsfrd = False
+def speculative_sample(
+        self,
+        draft_tokens: List[int],
+        draft_logits: List[List[float]],  # 来自draft model的logits
+        target_logits: List[List[float]],  # 来自verify_with_draft的logits
+        temperature: float = 1.0,
+        top_k: int = 1
+    ) -> Tuple[List[int], int]:
+        """
+        执行speculative sampling
+        
+        Args:
+            draft_tokens: K个draft生成的token
+            draft_logits: K个draft位置的logits
+            target_logits: K+1个target位置的logits (用于验证+bonus)
+            
+        Returns:
+            (accepted_tokens, num_accepted)
+        """
+        accepted = []
+        K = len(draft_tokens)
+        
+        for t in range(K):
+            if t >= len(target_logits) or t >= len(draft_logits):
+                break
+                
+            # 转换为tensor
+            q_logits = torch.tensor(target_logits[t], device=self.device)
+            p_logits = torch.tensor(draft_logits[t], device=self.device)
+            
+            # 应用temperature
+            if temperature != 1.0:
+                q_logits = q_logits / temperature
+                p_logits = p_logits / temperature
+            
+            # 计算概率分布
+            q_probs = F.softmax(q_logits, dim=-1)
+            p_probs = F.softmax(p_logits, dim=-1)
+            
+            draft_token = draft_tokens[t]
+            q_prob = q_probs[draft_token].item()
+            p_prob = p_probs[draft_token].item()
+            
+            # 计算接受概率
+            if p_prob < 1e-10:
+                accept_prob = 1.0 if q_prob > 1e-10 else 0.0
+            else:
+                accept_prob = min(1.0, q_prob / p_prob)
+            
+            # 采样r ~ U[0,1]
+            r = torch.rand(1).item()
+            
+            if r < accept_prob:
+                # 接受draft token
+                accepted.append(draft_token)
+            else:
+                # 拒绝，从(q-p)+重采样
+                residual = torch.clamp(q_probs - p_probs, min=0)
+                residual_sum = residual.sum()
+                
+                if residual_sum < 1e-10:
+                    probs = q_probs
+                else:
+                    probs = residual / residual_sum
+                
+                # top-k
+                if top_k > 0 and top_k < probs.shape[0]:
+                    top_k_probs, top_k_indices = torch.topk(probs, top_k)
+                    probs = torch.zeros_like(probs)
+                    probs.scatter_(0, top_k_indices, top_k_probs)
+                    probs = probs / probs.sum()
+                
+                new_token = torch.multinomial(probs, 1).item()
+                accepted.append(new_token)
+                # 拒绝后退出循环
+                return accepted, t + 1
+        
+        # 全部接受，采样bonus token
+        if K < len(target_logits):
+            bonus_logits = torch.tensor(target_logits[K], device=self.device)
+            if temperature != 1.0:
+                bonus_logits = bonus_logits / temperature
+            bonus_probs = F.softmax(bonus_logits, dim=-1)
+            
+            if top_k > 0 and top_k < bonus_probs.shape[0]:
+                top_k_probs, top_k_indices = torch.topk(bonus_probs, top_k)
+                bonus_probs = torch.zeros_like(bonus_probs)
+                bonus_probs.scatter_(0, top_k_indices, top_k_probs)
+                bonus_probs = bonus_probs / bonus_probs.sum()
+            
+            bonus_token = torch.multinomial(bonus_probs, 1).item()
+            accepted.append(bonus_token)
+        
+        return accepted, K + 1
 class SpeechTokenizer:
     def __init__(self, speech_tokenizer_model: str, feat_extractor: Callable, get_tokenizer: Callable, 
                  campplus_model: str, allowed_special: str = 'all',device: str = None):
@@ -248,7 +343,7 @@ class VocalNetModelStream:
                                                 })
             self.target_model = dispatch_model(self.target_model, device_map=device_map)
             self.draft_model = dispatch_model(self.draft_model, device_map=device_map)
-            
+            self.txt_eos_emb=self.draft_model.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
             self.__init_vocoder__()
 
 
@@ -336,65 +431,184 @@ class VocalNetModelStream:
         speech_tensor = speech.to(dtype=torch.float16, device='cuda', non_blocking=True)
         speech_length = speech_length.to(device='cuda', non_blocking=True)
 
-        step = 0
-        full_generated_text_idx = torch.empty([1,0], device='cuda', dtype=torch.int64)
-        self.model.reset_streaming_state()
-   
+        self.draft_model.reset_streaming_state()
+        self.draft_model.speech_generator.reset_streaming_cache()
+        self.draft_model.speech_generator.set_last_chunk(is_last=False)
+        self.draft_model.speech_generator.speech_token_num = self.speech_token_num
+        self.target_model.speech_generator.reset_streaming_cache()
+        self.target_model.speech_generator.set_last_chunk(is_last=False)
+        self.target_model.speech_generator.speech_token_num = self.speech_token_num
+
+        # 初始化speculative decoding专用状态
+        self.draft_model.all_txt_ids_specdiff = []
+        self.draft_model.punct_count_specdiff = 0
+        self.draft_model.last_punct_reset_specdiff = 0
+        self.draft_model.cur_hidden_states = []
+        self.draft_model.cur_text = ""
+        self.draft_model.units_preds = []
+        self.draft_model.all_logits_specdiff = []
+        draft_full_generated_text_idx = torch.empty([1, 0], device='cuda', dtype=torch.int64)
+        all_corrected_generated_text_idx = torch.empty([1, 0], device='cuda', dtype=torch.int64)
+        all_corrected_speech_list = torch.empty([1, 0], device='cuda', dtype=torch.int64)  # 存储验证后的正确tokens
+        draft_units_pred_list=torch.empty([1, 0], device='cuda', dtype=torch.int64)
+           
         sample_rate = None
         speech_list = []               
-
         with torch.inference_mode():
-            if self.s2s:
-                for generated_text_idx, units_pred, is_last_speech_chunk in self.model.streaming_generate_mtp(
-                    input_ids,
+            is_finished = False
+            
+            while not is_finished:
+                # ============================================================
+                # STEP 1: 异步生成一组文字
+                # ============================================================
+                text_result = await self.draft_model.generate_text_tokens_one_step(
+                    inputs=input_ids,
                     speech=speech_tensor,
                     speech_lengths=speech_length,
-                    temperature=0.1,
-                    top_p=0.1,
-                    top_k=0,
-                    use_cache=True,
-                    infer_mtp_token_num=2,
                     txt_token_num=self.txt_token_num,
-                    speech_token_num = self.speech_token_num,
-                    reset_interval=self.reset_interval
-                ):  
-                    if generated_text_idx is not None:
-                        full_generated_text_idx = torch.cat([full_generated_text_idx, generated_text_idx], dim=-1)
+                    reset_interval=self.reset_interval,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                    use_cache=True
+                )
 
-                    for unit_tensor in units_pred:
-                        sub_step = 0
-                        output_units = unit_tensor
+
+                draft_concat_ids, draft_special_flag, draft_is_last, draft_hidden_for_predict,draft_all_text_logit,draft_need_reset_speech_generator_streaming_cache = text_result
+
+                # 更新文字
+                if draft_concat_ids is not None:
+                    draft_full_generated_text_idx = torch.cat([draft_full_generated_text_idx, draft_concat_ids], dim=-1)
+                # ============================================================
+                # STEP 2: 异步生成draft语音tokens (K个)
+                # ============================================================
+                     
+                if draft_special_flag is None:
+                    is_finished=False
+                    self.draft_model.speech_generator.set_last_chunk(draft_is_last)
+                    self.draft_model.speech_generator.reset_streaming_cache() if draft_need_reset_speech_generator_streaming_cache else None
+                    get_draft_units_pred_list_task = asyncio.create_task(
+                        self.draft_model.speech_generator.streaming_predict_mtp_async(
+                            draft_hidden_for_predict,
+                            infer_mtp_token_num=self.config.infer_mtp_token_num
+                        )
+                    )
+                elif draft_special_flag==1:
+                    is_finished=True
+                    self.draft_model.speech_generator.set_last_chunk(draft_is_last)
+                    self.draft_model.speech_generator.reset_streaming_cache() if draft_need_reset_speech_generator_streaming_cache else None
+                    
+                    get_draft_units_pred_list_task = None
+                elif draft_special_flag==2:
+                    is_finished=True
+                    self.draft_model.speech_generator.set_last_chunk(draft_is_last)
+                    self.draft_model.speech_generator.reset_streaming_cache() if draft_need_reset_speech_generator_streaming_cache else None
+                    
+                    get_draft_units_pred_list_task = asyncio.create_task(
+                        self.draft_model.speech_generator.streaming_predict_mtp_async(
+                            draft_hidden_for_predict,
+                            infer_mtp_token_num=self.config.infer_mtp_token_num
+                        )
+                    )
+                else:
+                    is_finished=True
+                    self.draft_model.speech_generator.set_last_chunk(draft_is_last)
+                    self.draft_model.speech_generator.reset_streaming_cache() if draft_need_reset_speech_generator_streaming_cache else None
+                    
+                    get_draft_units_pred_list_task = asyncio.create_task(
+                        self.draft_model.speech_generator.streaming_predict_mtp_async(
+                            draft_hidden_for_predict,
+                            infer_mtp_token_num=self.config.infer_mtp_token_num
+                        )
+                    )
+                # ============================================================
+                # STEP 3: 并行执行 - vocoder扩散 + 验证
+                # 这是核心的并行优化!
+                # ============================================================
+                
+                verify_task = asyncio.create_task(
+                self.target_model.verify_text_with_draft_stream_async(
+                    inputs_embeds=self.draft_model.inputs_embeds, 
+                    attention_mask=self.draft_model.attention_mask,
+                    position_ids=self.draft_model.position_ids,
+                    draft_tokens=draft_full_generated_text_idx, 
+                    audio_unit_list=None,
+                )
+                )
+                temp=await get_draft_units_pred_list_task
+                draft_units_pred_list=torch.cat([draft_units_pred_list,temp],dim=-1) if temp is not None else draft_units_pred_list
+                vocoder_prediffuse_task_1=asyncio.create_task(
+                    self.cosy_vocoder.inference_zero_shot(
+                        speech_token=draft_units_pred_list,
+                        prompt_token=self.prompt_token,
+                        prompt_feat=self.speech_feat,
+                        embedding=self.embedding,
+                        stream=self.streaming,
+                        speed=1.0,
+                        uuid=global_uuid,
+                        is_last_speech_chunk=is_finished
+                    )
+                )
+                '''
+                if draft_tokens is None or draft_tokens.shape[1] <= 2:
+                    continue
+                
+                # draft tokens (不含SOS/EOS)
+                draft_content = draft_tokens[:, 1:-1]
+                '''
+                
+                
+                # ============================================================
+                # STEP 4: Speculative Sampling - 逐步更新tokens
+                # 根据target logits验证并修正draft tokens
+                # ============================================================
+                corrected_tokens = draft_content[0].tolist()  # 默认使用draft
+                
+                if target_logits_list and len(target_logits_list) > 0:
+                    flat_logits = target_logits_list[0]
+                    draft_token_list = draft_content[0].tolist()
+                    
+                    if flat_logits and len(flat_logits) >= len(draft_token_list):
+                        # 执行speculative sampling
+                        corrected_tokens, num_accepted = self.sampler.speculative_sample(
+                            draft_tokens=draft_token_list,
+                            draft_logits=flat_logits,  # 近似：用target作为draft
+                            target_logits=flat_logits,
+                            temperature=self.temperature,
+                            top_k=self.top_k
+                        )
                         
-                        for output in self.cosy_vocoder.inference_zero_shot(
-                            speech_token=output_units,
-                            prompt_token=self.prompt_token,
-                            prompt_feat=self.speech_feat,
-                            embedding=self.embedding,
-                            stream=True,
-                            speed=1,
-                            uuid=global_uuid,
-                            is_last_speech_chunk=is_last_speech_chunk
-                        ):
-                            speech = output['tts_speech']
-
-                            if sample_rate is None:
-                                sample_rate = self.cosy_vocoder.sample_rate
-
-                            speech_list.append(speech)
-                            sub_step += 1                        
-                        step += 1
-
-        merged_audio_path = None
-        if speech_list:
-            base_name = os.path.basename(wav_file).replace('mp3', 'wav')
-            merged_audio_path = os.path.join(self.audio_dir, base_name)
-            final_speech = torch.cat(speech_list, dim=-1)
-            torchaudio.save(merged_audio_path, final_speech.cpu(), sample_rate)
+                        # 记录接受率（可用于监控）
+                        accept_rate = num_accepted / len(draft_token_list) if draft_token_list else 1.0
+                
+                # 保存corrected tokens
+                all_corrected_speech.extend(corrected_tokens)
+                
+                # ============================================================
+                # STEP 5: 收集vocoder输出
+                # vocoder已经在并行执行，现在收集结果
+                # 注意: vocoder输出的是基于draft的音频
+                # 理想情况下，如果有rejection，应该用corrected重新生成
+                # 这里为了效率，我们接受draft的输出（speculative的精神是大部分会accept）
+                # ============================================================
+                for out in vocoder_results:
+                    speech_list.append(out['tts_speech'])
+                    if sample_rate is None:
+                        sample_rate = self.cosy_vocoder.sample_rate
+                
+                # ============================================================
+                # STEP 6: 状态重置处理
+                # ============================================================
+                current_text = self.tokenizer.decode(
+                    full_generated_text_idx.squeeze(0), skip_special_tokens=True
+                )
+                if current_text and current_text[-1] in ".!?":
+                    if self.model.punct_count_specdiff - self.model.last_punct_reset_specdiff >= self.config.reset_interval:
+                        self.model.speech_generator.reset_streaming_cache()
+                        self.model.last_punct_reset_specdiff = self.model.punct_count_specdiff
+                        self.model.units_preds = []
+                        self.model.cur_hidden_states = []
         
-        self.cosy_vocoder.model.reset_state(global_uuid)
-        full_generated_text = self.tokenizer.decode(full_generated_text_idx[0].cpu().numpy(), skip_special_tokens=True)
-        return {"text": full_generated_text.strip(), 'audio': merged_audio_path} 
-
 
 
 

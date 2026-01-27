@@ -288,7 +288,6 @@ class VocalNetModelStream:
 
     def set_audio_dir(self, output_dir):
         self.audio_dir = output_dir
-
     def __call__(self, messages: list):
         wav_file = messages[0]['path']
 

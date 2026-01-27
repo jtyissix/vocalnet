@@ -75,7 +75,8 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
             
         self.reset_streaming_state()
         self.post_init()
-        self.all_txt_ids_specdiff = [] 
+        self.all_txt_ids_specdiff = []
+        self.all_logits_specdiff = [] 
         #this differs from all txt ids in streaming_generate_mtp,
         #because this is used for my step by step specdiff
         self.punct_count_specdiff = 0  
@@ -88,7 +89,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         self.cur_text = ""
         self.units_preds = []
         self.last_id_embeds = None
-    
+        self.current_attention_mask=None
     def initialize_speech_generator(self, model_args):
         self.config.speech_generator_type = model_args.speech_generator_type
         if 'ar' in self.config.speech_generator_type:
@@ -584,19 +585,19 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         **kwargs,):
         self.txt_token_num = txt_token_num
         #self.speech_generator.speech_token_num = speech_token_num
-        position_ids = kwargs.pop("position_ids", None)
-        attention_mask = kwargs.pop("attention_mask", None)
+        self.position_ids = kwargs.pop("position_ids", None)
+        self.attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("inputs_embeds is not supported")
         first_step = self.past_key_values is None
         if first_step:
             if speech is not None:
                 (
-                    inputs,
-                    position_ids,
-                    attention_mask,
+                    self.inputs,
+                    self.position_ids,
+                    self.attention_mask,
                     _,
-                    inputs_embeds,
+                    self.inputs_embeds,
                     _
                 ) = self.prepare_inputs_labels_for_speech_and_text(
                     inputs,
@@ -608,10 +609,11 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                     speech_lengths
                 )
             else:
-                inputs_embeds = self.get_model().embed_tokens(inputs)
-            current_attention_mask = attention_mask
+                self.inputs_embeds = self.get_model().embed_tokens(inputs)
+            self.current_attention_mask = self.attention_mask
         else:
-            current_attention_mask = torch.full([1, 1], True, device=self.last_id_embeds.device)
+            #current_attention_mask = torch.full([1, 1], True, device=self.last_id_embeds.device)
+            pass
         generated_ids_list = []
         #all_txt_ids = []
         #self.units_preds = []
@@ -623,14 +625,16 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                 last_id = torch.tensor([[128009]], device=inputs_embeds.device)
                 return_tts_state = txt_eos_emb
             else:
-                last_id, self.past_key_values, return_tts_state = self._generate_one_step(
-                    inputs_embeds=inputs_embeds if first_step else self.last_id_embeds,
-                    attention_mask=current_attention_mask,
+                last_id, self.past_key_values, return_tts_state,last_logit = self._generate_one_step(
+                    inputs_embeds=self.inputs_embeds if first_step else self.last_id_embeds,
+                    attention_mask=self.current_attention_mask,
                     past_key_values=self.past_key_values,
+                    require_logits=True,
                     **kwargs
                 )
                 self.all_txt_ids_specdiff.append(last_id)
-            
+                self.all_logits_specdiff.append(last_logit)
+
             self.punct_count_specdiff += 1  
             generated_ids_list.append(last_id)
 
@@ -656,13 +660,14 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                 generated_ids_list = []
                 self.cur_hidden_states = []
                 self.cur_text = ""
-
+                need_reset_speech_generator_cache=True
                 #self.speech_generator.reset_streaming_cache()
                 #self.speech_generator.set_last_chunk(is_last=False)
                 self.last_punct_reset_specdiff = self.punct_count_specdiff
-                return concat_ids, None,is_last,hidden_for_predict
+                return concat_ids, None,is_last,hidden_for_predict,self.all_logits_specdiff,need_reset_speech_generator_cache
             if last_id[0][0] == 128009:
                 is_last=True
+                need_reset_speech_generator_cache=False
                 if generated_ids_list and generated_ids_list[0][0][0] != 128009:
                     accumulated_hidden = torch.cat(self.cur_hidden_states, dim=1)
                     hidden_for_predict = torch.cat([accumulated_hidden, txt_eos_emb], dim=1)
@@ -673,9 +678,9 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                     if units_pred is not None:
                         self.units_preds.append(units_pred)
                     '''
-                    return concat_ids, None, is_last,hidden_for_predict
+                    return concat_ids, 3, is_last,hidden_for_predict,self.all_logits_specdiff,need_reset_speech_generator_cache
                 elif punct_count - last_punct_reset < 2:
-                    return None, 1, is_last,None
+                    return None, 1, is_last,None,self.all_logits_specdiff,need_reset_speech_generator_cache
                 else:
                     '''
                     units_pred = self.speech_generator.streaming_predict_mtp(
@@ -684,13 +689,14 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                     if units_pred is not None:
                         self.units_preds.append(units_pred)
                     '''
-                    return None, 2, True,None
+                    return None, 2, is_last,None,self.all_logits_specdiff,need_reset_speech_generator_cache
             if self.past_key_values is not None:
                 self.last_id_embeds = self.get_model().embed_tokens(last_id)
                 past_len = self.past_key_values[0][0].size(2)
-                current_attention_mask = torch.ones(1, past_len + 1, device=self.last_id_embeds.device)
+                self.current_attention_mask = torch.ones(1, past_len + 1, device=self.last_id_embeds.device)
                 first_step = False
         is_last=False
+        need_reset_speech_generator_cache=False
         accumulated_hidden = torch.cat(self.cur_hidden_states, dim=1)
         hidden_for_predict = accumulated_hidden  
         '''
@@ -702,7 +708,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         generated_ids_list.clear()
         self.cur_hidden_states = []
         self.cur_text = ""
-        return concat_ids, None, is_last,hidden_for_predict
+        return concat_ids, None, is_last,hidden_for_predict,self.all_logits_specdiff,need_reset_speech_generator_cache
                 
 
 
@@ -798,6 +804,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         # 提取draft部分的hidden states
         hidden_states = outputs.hidden_states[-1]  # 最后一层
         draft_hidden = hidden_states[:, inputs_embeds.shape[1]-1:-1, :]  # 只要draft部分
+        #流式这里要不要把最后一个hidden切掉我也没想明白，看情况
         #这里是否需要先verify一遍？准确率？
         #breakpoint()
         # 按照stop_tokens切分
@@ -856,6 +863,115 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
                 logits_list.append(segment_logits)
         
         return logits_list
+    @torch.no_grad()
+    def verify_with_draft_stream(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        #draft_seq_list,
+        audio_unit_list,
+        infer_mtp_token_num: int = 2,
+        
+    ) -> torch.Tensor:
+        """
+        验证draft tokens，返回logits
+        Args:
+            inputs: input_ids
+            speech: 音频特征
+            speech_lengths: 音频长度
+            draft_tokens: (1, k) draft生成的tokens
+            infer_mtp_token_num: MTP层数
+        Returns:
+            logits_list: 每个segment对应的logits列表
+        """
+        # 准备inputs
+        
+        # 拼接draft_tokens到inputs
+        draft_embeds = self.get_model().embed_tokens(draft_tokens)
+        full_embeds = torch.cat([inputs_embeds, draft_embeds], dim=1)
+        
+        # 更新attention_mask
+        if attention_mask is not None:
+            draft_mask = torch.ones(1, draft_tokens.shape[1], device=attention_mask.device)
+            full_attention_mask = torch.cat([attention_mask, draft_mask], dim=1)
+        else:
+            full_attention_mask = None
+        
+        # Forward获取所有hidden states
+        outputs = super(OmniSpeechLlamaForCausalLM, self).forward(
+            inputs_embeds=full_embeds,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # 提取draft部分的hidden states
+        hidden_states = outputs.hidden_states[-1]  # 最后一层
+        draft_hidden = hidden_states[:, inputs_embeds.shape[1]-1:-1, :]  # 只要draft部分
+        #流式这里要不要把最后一个hidden切掉我也没想明白，看情况
+        #这里是否需要先verify一遍？准确率？
+        #breakpoint()
+        # 按照stop_tokens切分
+        stop_tokens = [13, 30, 0, 11]  # , . ! ?
+        #here we only divide the generated tokens i.e. draft tokens
+        all_tokens = draft_tokens[0].tolist()
+        
+        # 找stop token位置
+        stop_token_indices = [i for i, token in enumerate(all_tokens) if token in stop_tokens]
+        filter_stop_token_indices = [0]
+        token_num_bound = 50
+        
+        while stop_token_indices:
+            index = stop_token_indices.pop(0)
+            if index - filter_stop_token_indices[-1] > token_num_bound:
+                filter_stop_token_indices.append(index)
+        
+        if filter_stop_token_indices[-1] == len(all_tokens) - 2:
+            filter_stop_token_indices[-1] = len(all_tokens) - 1
+        else:
+            filter_stop_token_indices += [len(all_tokens) - 1]
+        
+        filter_stop_token_indices = [index + 1 for index in filter_stop_token_indices]
+        filter_stop_token_indices[0] = 0
+        
+        # 切分hidden states
+        txt_eos_emb = self.get_model().embed_tokens(torch.tensor([[128009]], device=hidden_states.device))
+        
+        hidden_states_list = [
+            draft_hidden[:, filter_stop_token_indices[i]:filter_stop_token_indices[i+1], :] 
+            for i in range(len(filter_stop_token_indices) - 1)
+        ]
+        hidden_states_list = [
+            torch.cat([hidden, txt_eos_emb], dim=1) 
+            for hidden in hidden_states_list
+        ]
+        #breakpoint()
+        #!!!注意待会要改掉，返回第一个也是sos，但是送进pre还会自己加，要从第二个开始取
+        #解决方案：speech_generator_ar_mtp verify等不要再添加sos_token
+        # 对每个segment调用speech_generator
+        logits_list = []
+        for idx,hidden_segment in enumerate(hidden_states_list):
+            if infer_mtp_token_num > 0:
+                # 调用verify_mtp
+                #this verify_mtp will be modified later
+            
+                segment_logits = self.speech_generator.verify(
+                    hidden_segment,audio_unit_list[idx]
+                )
+                logits_list.append(segment_logits)
+            else:
+                # 调用verify
+                segment_logits = self.speech_generator.verify(
+                    hidden_segment,audio_unit_list[idx]
+                )
+                logits_list.append(segment_logits)
+        
+        return logits_list
+    @torch.no_grad()
+    async def verify_with_draft_stream_async(self,*args,**kwargs):
+        return self.verify_with_draft_stream(*args,**kwargs)
     @torch.no_grad()
     def verify_text_with_draft(
         self,
@@ -939,8 +1055,59 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         #这里是否需要先verify一遍？准确率？
         #breakpoint()
         return outputs.logits[:, inputs_embeds.shape[1]-1:, :]
+    @torch.no_grad()
+    def verify_text_with_draft_stream(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask,: torch.Tensor,
+        position_ids: torch.Tensor,
+        draft_tokens: torch.Tensor,
+        #draft_seq_list,
+        audio_unit_list,
+        infer_mtp_token_num: int = 2,
         
+    ) -> torch.Tensor:
+        """
+        验证draft tokens，返回logits
+        Args:
+            inputs: input_ids
+            speech: 音频特征
+            speech_lengths: 音频长度
+            draft_tokens: (1, k) draft生成的tokens
+            infer_mtp_token_num: MTP层数
+        Returns:
+            logits_list: 每个segment对应的logits列表
+        """
         
+        # 拼接draft_tokens到inputs
+        draft_embeds = self.get_model().embed_tokens(draft_tokens)
+        full_embeds = torch.cat([inputs_embeds, draft_embeds], dim=1)
+        
+        # 更新attention_mask
+        if attention_mask is not None:
+            draft_mask = torch.ones(1, draft_tokens.shape[1], device=attention_mask.device)
+            full_attention_mask = torch.cat([attention_mask, draft_mask], dim=1)
+        else:
+            full_attention_mask = None
+        
+        # Forward获取所有hidden states
+        outputs = super(OmniSpeechLlamaForCausalLM, self).forward(
+            inputs_embeds=full_embeds,
+            attention_mask=full_attention_mask,
+            output_hidden_states=True,
+            return_dict=True
+        )
+        
+        # 提取draft部分的hidden states
+        #hidden_states = outputs.hidden_states[-1]  # 最后一层
+        #draft_hidden = hidden_states[:, inputs_embeds.shape[1]-1:-1, :]  # 只要draft部分和bonus token
+        #这里是否需要先verify一遍？准确率？
+        #breakpoint()
+        return outputs.logits[:, inputs_embeds.shape[1]-1:, :]
+      
+    @torch.no_grad()
+    async def verify_text_with_draft_stream_async(self,*args,**kwargs):
+        return self.verify_text_with_draft_stream(*args,**kwargs)   
     @torch.no_grad()
     #this function should be hold deprecated immediately
     def check_correctness_temp_func(

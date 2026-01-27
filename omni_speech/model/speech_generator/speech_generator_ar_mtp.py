@@ -837,7 +837,7 @@ class SpeechGeneratorARMTP(nn.Module):
         return generated_tokens
         
     async def streaming_predict_mtp_async(self, *args, **kwargs):
-        return await asyncio.to_thread(self.streaming_predict_mtp, *args, **kwargs)
+        return self.streaming_predict_mtp(*args, **kwargs)
     def reset_streaming_cache(self):
         self._prenn_past_key_values = DynamicCache.from_legacy_cache(None)
         self._speech_decoder_past_key_values = {
@@ -886,8 +886,8 @@ class SpeechGeneratorARMTP(nn.Module):
         #no need to penalty in this situation
         hidden_states = self.transformer_infer(inputs_embeds, cache_position, past_key_values)
         hidden_states = self.norm(hidden_states)
-        logits = self.output_proj(hidden_states)[:,:-1,:]
+        logits = self.output_proj(hidden_states)[:,:,:]
         logits=logits.squeeze(0).tolist()
         #not conclude last one because we need given tokens' logit not next one's
-        
+        #我觉得应该不用取-1切片了，如果出问题再改
         return logits

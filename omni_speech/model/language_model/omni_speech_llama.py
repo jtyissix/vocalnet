@@ -248,6 +248,7 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
         temperature: float = 1.0,
         top_k: int = 0,
         top_p: float = 1.0,
+        require_logits: bool = False,
         **kwargs
     ) -> Tuple[torch.LongTensor, List[torch.FloatTensor]]:
         """
@@ -265,6 +266,7 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
         - stat: The updated state information.
         - past_key_values: The model's historical key-value pairs, used for cross-step memory.
         - hidden_state: The model's hidden state, used to maintain cross-step contextual information.
+        - logits: The output logits from the model (optional).
         """
         model = self.get_model()
         outputs = model(
@@ -286,11 +288,9 @@ class OmniSpeechLlamaForCausalLM(LlamaForCausalLM, OmniSpeechMetaForCausalLM):
         last_logit = self.lm_head(outputs['last_hidden_state'][:, -1:, :])
         last_id = self._post_decode(last_logit, temperature=temperature, top_k=top_k, top_p=top_p)
         return_tts_state = outputs['last_hidden_state'][:, -1:, :]
-        return last_id, outputs['past_key_values'], return_tts_state
-        # if last_id[0][0] == 128009: # end of text(与llama3保持一致，改用其他模型需要对应修改)
-        #     return None, outputs['past_key_values'], return_tts_state
-        # else:
-        #     return last_id, outputs['past_key_values'], return_tts_state
+        if not require_logits:
+            return last_id, outputs['past_key_values'], return_tts_state
+        return last_id, outputs['past_key_values'], return_tts_state, last_logit
 
 AutoConfig.register("omni_speech_llama", OmniSpeechConfig)
 AutoModelForCausalLM.register(OmniSpeechConfig, OmniSpeechLlamaForCausalLM)
