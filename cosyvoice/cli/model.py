@@ -718,3 +718,149 @@ class CosyVoice2Model:
             self.tts_speech_token_dict.pop(uuid, None)
             self.hift_cache_dict.pop(uuid, None)
             self.token_offsets.pop(uuid, None)
+    #现在只支持first chunk
+    def tts_direct_update_one_step(self, speech_tokens: torch.Tensor, flow_embedding: torch.Tensor, prompt_token: torch.Tensor, prompt_feat: torch.Tensor, stream=False, speed=1.0, chunk_para=[3,3,1], uuid=None, is_last_speech_chunk=False, **kwargs):
+        if uuid is None:
+            uuid = str(uuid.uuid1())
+
+        with self.lock:
+            if uuid not in self.hift_cache_dict:
+                self.hift_cache_dict[uuid] = None
+            if uuid not in self.tts_speech_token_dict:
+                self.tts_speech_token_dict[uuid] = []
+            if uuid not in self.token_offsets:
+                self.token_offsets[uuid] = 0
+            self.tts_speech_token_dict[uuid].extend(speech_tokens.squeeze().tolist())
+            speech_tokens = self.tts_speech_token_dict[uuid]
+        
+        if stream:
+            token_offset = self.token_offsets[uuid]
+            # required_tokens = self.token_hop_len + self.flow.pre_lookahead_len
+            
+            if not is_last_speech_chunk:
+                required_tokens = 15 # NOTE
+                available_tokens = len(speech_tokens[token_offset:])
+                if available_tokens >= required_tokens:
+                    this_tts_speech_token = torch.tensor(
+                        speech_tokens[: token_offset + required_tokens]
+                    ).unsqueeze(dim=0).long().to(self.device)
+                    
+                    if prompt_token.dim() == 3 and prompt_token.size(1) == 1:
+                        prompt_token = prompt_token.squeeze(1)
+                    elif prompt_token.dim() != 2:
+                        raise ValueError(f"prompt_token 的维度应为 2D, 但得到 {prompt_token.dim()}D")
+                    this_tts_speech = self.token2wav_one_step(
+                        token=this_tts_speech_token,
+                        prompt_token=prompt_token,
+                        prompt_feat=prompt_feat,
+                        embedding=flow_embedding,
+                        uuid=uuid,
+                        token_offset=token_offset,
+                        finalize=False
+                    )
+                    # token_offset += self.token_hop_len
+                    token_offset += 12 # NOTE
+                    self.token_offsets[uuid] = token_offset
+                    return {'tts_speech': this_tts_speech.cpu()}
+            else:
+                pass
+                print("code bug!is_last_speech_chunk")
+                '''
+                while True:
+                    required_tokens = self.token_hop_len + self.flow.pre_lookahead_len # NOTE
+                    available_tokens = len(speech_tokens[token_offset:])
+                    if available_tokens >= required_tokens:
+                        this_tts_speech_token = torch.tensor(
+                            speech_tokens[: token_offset + required_tokens]
+                        ).unsqueeze(dim=0).long().to(self.device)
+                        
+                        if prompt_token.dim() == 3 and prompt_token.size(1) == 1:
+                            prompt_token = prompt_token.squeeze(1)
+                        elif prompt_token.dim() != 2:
+                            raise ValueError(f"prompt_token 的维度应为 2D, 但得到 {prompt_token.dim()}D")
+                        this_tts_speech = self.token2wav_one_step(
+                            token=this_tts_speech_token,
+                            prompt_token=prompt_token,
+                            prompt_feat=prompt_feat,
+                            embedding=flow_embedding,
+                            uuid=uuid,
+                            token_offset=token_offset,
+                            finalize=False
+                        )
+                        token_offset += self.token_hop_len
+                        self.token_offsets[uuid] = token_offset
+                        yield {'tts_speech': this_tts_speech.cpu()}
+                    if len(speech_tokens[token_offset:]) < required_tokens:
+                        break
+                this_tts_speech_token = torch.tensor(speech_tokens).unsqueeze(dim=0).long().to(self.device)
+                this_tts_speech = self.token2wav_one_step(
+                        token=this_tts_speech_token,
+                        prompt_token=prompt_token,
+                        prompt_feat=prompt_feat,
+                        embedding=flow_embedding,
+                        uuid=uuid,
+                        token_offset=token_offset,
+                        finalize=True,
+                        speed=speed
+                )
+                self.token_offsets[uuid] = len(speech_tokens)
+                yield {'tts_speech': this_tts_speech.cpu()}
+                '''
+        else:
+            all_tokens = self.tts_speech_token_dict[uuid]
+            if not all_tokens:
+                import pdb; pdb.set_trace()
+                raise ValueError("没有可生成的tokens")
+            this_tts_speech_token = torch.tensor(all_tokens).long().unsqueeze(dim=0).to(self.device)
+            
+            if prompt_token.dim() == 3 and prompt_token.size(1) == 1:
+                prompt_token = prompt_token.squeeze(1)
+            elif prompt_token.dim() != 2:
+                raise ValueError(f"prompt_token 的维度应为 2D, 但得到 {prompt_token.dim()}D")
+            this_tts_speech = self.token2wav_one_step(
+                token=this_tts_speech_token,
+                prompt_token=prompt_token,
+                prompt_feat=prompt_feat,
+                embedding=flow_embedding,
+                uuid=uuid,
+                token_offset=0,
+                finalize=True,
+                speed=speed
+            )
+            self.token_offsets[uuid] = len(all_tokens)
+            yield {'tts_speech': this_tts_speech.cpu()}
+    def token2wav_one_step(self, token, prompt_token, prompt_feat, embedding, uuid, token_offset, finalize=False, speed=1.0):
+        tts_mel, _ = self.flow.inference_one_step(token=token.to(self.device),
+                                         token_len=torch.tensor([token.shape[1]], dtype=torch.int32).to(self.device),
+                                         prompt_token=prompt_token.to(self.device),
+                                         prompt_token_len=torch.tensor([prompt_token.shape[1]], dtype=torch.int32).to(self.device),
+                                         prompt_feat=prompt_feat.to(self.device),
+                                         prompt_feat_len=torch.tensor([prompt_feat.shape[1]], dtype=torch.int32).to(self.device),
+                                         embedding=embedding.to(self.device),
+                                         finalize=finalize)
+        if tts_mel is None:
+            return None
+        tts_mel = tts_mel[:, :, token_offset * self.flow.token_mel_ratio:]
+        # append hift cache
+        if self.hift_cache_dict[uuid] is not None:
+            hift_cache_mel, hift_cache_source = self.hift_cache_dict[uuid]['mel'], self.hift_cache_dict[uuid]['source']
+            tts_mel = torch.concat([hift_cache_mel, tts_mel], dim=2)
+        else:
+            hift_cache_source = torch.zeros(1, 1, 0)
+        # keep overlap mel and hift cache
+        if finalize is False:
+            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+            if self.hift_cache_dict[uuid] is not None:
+                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+            self.hift_cache_dict[uuid] = {'mel': tts_mel[:, :, -self.mel_cache_len:],
+                                          'source': tts_source[:, :, -self.source_cache_len:],
+                                          'speech': tts_speech[:, -self.source_cache_len:]}
+            tts_speech = tts_speech[:, :-self.source_cache_len]
+        else:
+            if speed != 1.0:
+                assert self.hift_cache_dict[uuid] is None, 'speed change only support non-stream inference mode'
+                tts_mel = F.interpolate(tts_mel, size=int(tts_mel.shape[2] / speed), mode='linear')
+            tts_speech, tts_source = self.hift.inference(speech_feat=tts_mel, cache_source=hift_cache_source)
+            if self.hift_cache_dict[uuid] is not None:
+                tts_speech = fade_in_out(tts_speech, self.hift_cache_dict[uuid]['speech'], self.speech_window)
+        return tts_speech

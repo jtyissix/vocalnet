@@ -126,7 +126,9 @@ class ConditionalCFM(BASECFM):
                 dt = t_span[step + 1] - t
 
         return sol[-1].float()
-
+    def forward_one_step(self, mu, mask, n_timesteps, temperature=1.0, spks=None, cond=None, prompt_len=0, flow_cache=torch.zeros(1, 80, 0, 2)):
+        #our key framework: cross-token flow cache
+        pass
     def forward_estimator(self, x, mask, mu, t, spks, cond):
         if isinstance(self.estimator, torch.nn.Module):
             return self.estimator.forward(x, mask, mu, t, spks, cond)
@@ -233,3 +235,48 @@ class CausalConditionalCFM(ConditionalCFM):
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         return self.solve_euler(z, t_span=t_span, mu=mu, mask=mask, spks=spks, cond=cond), None
+    
+    def forward_one_step(self, now_cache,mu, mask,t_span, now_steps, temperature=1.0, spks=None, cond=None):
+        #our key framework: cross-token flow cache
+        t, _, dt = t_span[0], t_span[-1], t_span[now_steps+1] - t_span[now_steps]
+        t = t.unsqueeze(dim=0)
+        x=now_cache
+        # I am storing this because I can later plot it by putting a debugger here and saving it to a file
+        # Or in future might add like a return_all_steps flag
+        
+
+        if self.inference_cfg_rate > 0:
+            # Do not use concat, it may cause memory format changed and trt infer with wrong results!
+            x_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+            mask_in = torch.zeros([2, 1, x.size(2)], device=x.device, dtype=x.dtype)
+            mu_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+            t_in = torch.zeros([2], device=x.device, dtype=x.dtype)
+            spks_in = torch.zeros([2, 80], device=x.device, dtype=x.dtype)
+            cond_in = torch.zeros([2, 80, x.size(2)], device=x.device, dtype=x.dtype)
+        else:
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in = x, mask, mu, t, spks, cond
+        
+        # Classifier-Free Guidance inference introduced in VoiceBox
+        if self.inference_cfg_rate > 0:
+            x_in[:] = x
+            mask_in[:] = mask
+            mu_in[0] = mu
+            t_in[:] = t.unsqueeze(0)
+            spks_in[0] = spks
+            cond_in[0] = cond
+        else:
+            x_in, mask_in, mu_in, t_in, spks_in, cond_in = x, mask, mu, t, spks, cond
+        dphi_dt = self.forward_estimator(
+            x_in, mask_in,
+            mu_in, t_in,
+            spks_in,
+            cond_in
+        )
+        if self.inference_cfg_rate > 0:
+            dphi_dt, cfg_dphi_dt = torch.split(dphi_dt, [x.size(0), x.size(0)], dim=0)
+            dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - self.inference_cfg_rate * cfg_dphi_dt)
+        x = x + dt * dphi_dt
+        #t = t + dt
+        
+
+        return x.float(),None

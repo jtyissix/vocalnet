@@ -711,7 +711,12 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         return concat_ids, None, is_last,hidden_for_predict,self.all_logits_specdiff,need_reset_speech_generator_cache
                 
 
-
+    async def generate_text_tokens_one_step_async(self, *args, **kwargs):
+    """异步包装版本"""
+    return await asyncio.to_thread(
+        self.generate_text_tokens_one_step,
+        *args, **kwargs
+    )
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None,
                                       inputs_embeds=None, **kwargs):
         speech = kwargs.pop("speech", None)
@@ -971,7 +976,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
         return logits_list
     @torch.no_grad()
     async def verify_with_draft_stream_async(self,*args,**kwargs):
-        return self.verify_with_draft_stream(*args,**kwargs)
+        return await asyncio.to_thread(self.verify_with_draft_stream,*args,**kwargs)
     @torch.no_grad()
     def verify_text_with_draft(
         self,
@@ -1107,7 +1112,7 @@ class OmniSpeech2SLlamaForCausalLM(OmniSpeechLlamaForCausalLM, GenerationWithCTC
       
     @torch.no_grad()
     async def verify_text_with_draft_stream_async(self,*args,**kwargs):
-        return self.verify_text_with_draft_stream(*args,**kwargs)   
+        return await asyncio.to_thread(self.verify_text_with_draft_stream,*args,**kwargs)   
     @torch.no_grad()
     #this function should be hold deprecated immediately
     def check_correctness_temp_func(

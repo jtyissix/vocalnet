@@ -308,7 +308,25 @@ class CosyvoiceVocoder:
 
         for model_output in self.model.tts_direct_update(**model_input):
             yield model_output
+    def reset_vocoder_streaming_state(self):
+        pass
+    def inference_one_step(self, speech_token: torch.Tensor, prompt_token: torch.Tensor, prompt_feat: torch.Tensor, embedding: torch.Tensor, stream: bool = False, speed: float = 1.0, uuid: str = None, is_last_speech_chunk: bool = False):
+        speech_token = speech_token.squeeze(1) if speech_token.dim() == 3 else speech_token
+        prompt_token = prompt_token.squeeze(1) if prompt_token.dim() == 3 else prompt_token
 
+        model_input = {
+            'speech_tokens': speech_token,
+            'flow_embedding': embedding,
+            'prompt_token': prompt_token,
+            'prompt_feat': prompt_feat,
+            'stream': stream,
+            'speed': speed,
+            'uuid': uuid,
+            'is_last_speech_chunk': is_last_speech_chunk
+        }
+
+        model_output = await self.model.tts_direct_update_one_step_async(**model_input)
+        return model_output
 class VocalNetModelStream:
     def __init__(self, draft_model_path: str,target_model_path:str, vocoder_path: str = COSYVOICE_MODEL, s2s: bool = True, **kwargs):
         self.s2s = s2s

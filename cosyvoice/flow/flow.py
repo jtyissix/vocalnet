@@ -185,7 +185,24 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         self.only_mask_loss = only_mask_loss
         self.token_mel_ratio = token_mel_ratio
         self.pre_lookahead_len = pre_lookahead_len
-
+        self.step_cache=None
+        self.n_timesteps=10
+    def reset_step_cache(self,reset_step_cache):
+        if reset_step_cache:
+            #self.step_cache=None
+            self.now_step=0
+            self.t_span = torch.linspace(0, 1, self.n_timesteps + 1, device=mu.device, dtype=mu.dtype)
+            if self.decoder.t_scheduler == 'cosine':
+                self.t_span = 1 - torch.cos(self.t_span * 0.5 * torch.pi)
+            self.step_cache=torch.randn([1, 80, 50 * 300])
+            if self.decoder.fp16 is True:
+                self.step_cache=self.step_cache.half()
+        self.mu=None
+        self.cond=None
+        self.mask=None
+        self.spk=None
+        
+        
     @torch.inference_mode()
     def inference(self,
                   token,
@@ -228,3 +245,58 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         feat = feat[:, :, mel_len1:]
         assert feat.shape[2] == mel_len2
         return feat, None
+    
+    @torch.inference_mode()
+    def inference_one_step(self,
+                  token,
+                  token_len,
+                  prompt_token,
+                  prompt_token_len,
+                  prompt_feat,
+                  prompt_feat_len,
+                  embedding,
+                  finalize):
+        assert token.shape[0] == 1
+        # xvec projection
+        if self.mu is None:
+            embedding = F.normalize(embedding, dim=1)
+            embedding = self.spk_embed_affine_layer(embedding)
+            # concat text and prompt_text
+            token, token_len = torch.concat([prompt_token, token], dim=1), prompt_token_len + token_len
+            mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
+            token = self.input_embedding(torch.clamp(token, min=0)) * mask
+
+            # text encode
+            h, h_lengths = self.encoder(token, token_len)
+            if finalize is False:
+                h = h[:, :-self.pre_lookahead_len * self.token_mel_ratio]
+            mel_len1, mel_len2 = prompt_feat.shape[1], h.shape[1] - prompt_feat.shape[1]
+            h = self.encoder_proj(h)
+
+            # get conditions
+            conds = torch.zeros([1, mel_len1 + mel_len2, self.output_size], device=token.device)
+            conds[:, :mel_len1] = prompt_feat
+            conds = conds.transpose(1, 2)
+            self.mu=h.transpose(1, 2).contiguous()
+            self.cond=conds
+            self.mask=(~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+            self.spk=embedding
+            self.step_cache=self.step_cache[:, :, :mu.size(2)].to(mu.device)
+        #mask = (~make_pad_mask(torch.tensor([mel_len1 + mel_len2]))).to(h)
+        self.step_cache, _ = self.decoder.forward_one_step(
+            now_cache=self.step_cache,
+            mu=self.mu,
+            mask=self.mask.unsqueeze(1),
+            t_span=self.t_span,
+            now_steps=self.now_step,
+            spks=self.spk,
+            cond=self.cond,
+            n_timesteps=10
+        )
+        self.now_step+=1
+        if not self.now_step==self.n_timesteps:
+            return None, None
+        else:
+            self.step_cache = self.step_cache[:, :, mel_len1:]
+            assert self.step_cache.shape[2] == mel_len2
+            return self.step_cache, None
